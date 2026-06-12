@@ -8,6 +8,7 @@
 
 - `POST /v1/chat/completions`：兼容 Chat Completions，请求支持普通 JSON 与 stream。
 - `POST /v1/responses`：兼容 Responses API 文本链路，请求支持普通 JSON 与 stream。
+- `GET /v1/models`：返回后台最近一次模型探测得到的可用模型列表；未探测时默认返回 `auto`。这是本地缓存结果，不是 ChatGPT 网页官方实时模型枚举接口。
 - Function Calling：兼容 OpenAI `tools`/`tool_choice`、旧版 `functions`/`function_call`，支持多工具调用、工具结果回填与流式 tool calls。
 - `GET /v1/accTokens`：查看配置账号池可用数量。
 - 本地 `sk-` auth key：使用配置文件中的 `chatgpts` 账号池请求上游。
@@ -30,6 +31,8 @@
 | `RENDER_DISK_MOUNT_PATH` | 空 | 可选，Render 持久磁盘挂载目录；未设置 `CONFIG_DIR` 时会用它作为配置目录 |
 
 后台管理界面：访问 `/admin`。在 Render 等云平台部署时，只需要先配置后台登录环境变量，登录后即可在页面里维护本地 API key、直传前缀、上游 ChatGPT token、代理和 base URL。
+
+后台还提供“模型探测”按钮：会批量测试常见模型 slug 是否可被当前网页版账号接受，并把结果缓存下来供 `/v1/models` 返回。
 
 | 环境变量 | 作用 |
 | --- | --- |
@@ -93,6 +96,13 @@ chatgpts:
 - `chatgpts[].access_token` 是账号池的真实上游 access token。通过本地 `sk-` key 请求时会从这里选择账号。
 - 代理优先级为账号代理优先：`chatgpts[].proxy` 不为空时使用账号代理；为空时回退到全局 `proxy`。
 - `chatgpt_base_url` 为空时默认使用 `https://chatgpt.com`。
+
+`chatgpts[].access_token` 获取方法：
+
+1. 登录 `https://chatgpt.com`
+2. 登录完成后打开 `https://chatgpt.com/api/auth/session`
+3. 在返回的 JSON 中找到 `accessToken` 字段
+4. 把这个 `accessToken` 的值填入后台或配置文件里的 `chatgpts[].access_token`
 
 ## 运行
 
