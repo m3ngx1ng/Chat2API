@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"chat2api/app/chatgpt_backend"
 	"chat2api/app/common"
+	"chat2api/app/conf"
 	"chat2api/app/result"
 	"chat2api/app/types/completions"
 	"encoding/json"
@@ -11,8 +12,6 @@ import (
 	"net/http"
 	"sort"
 	"strings"
-	"sync"
-	"time"
 
 	"github.com/aurorax-neo/tls_client_httpi"
 	"github.com/gin-gonic/gin"
@@ -27,13 +26,11 @@ type probedModel struct {
 	Reason    string `json:"reason,omitempty"`
 }
 
-type modelProbeCache struct {
-	mu        sync.RWMutex
-	models    []probedModel
-	updatedAt int64
+type adminProbeModelsRequest struct {
+	AccountID   string `json:"account_id"`
+	AccessToken string `json:"access_token"`
+	Proxy       string `json:"proxy"`
 }
-
-var modelsCache = &modelProbeCache{}
 
 func defaultModelCandidates() []string {
 	return []string{
@@ -50,48 +47,45 @@ func defaultModelCandidates() []string {
 	}
 }
 
-func cachedAvailableModels() []probedModel {
-	modelsCache.mu.RLock()
-	defer modelsCache.mu.RUnlock()
-	if len(modelsCache.models) == 0 {
-		out := make([]probedModel, 0, 1)
-		out = append(out, probedModel{ID: "auto", Object: "model", OwnedBy: "chatgpt-web", Available: true})
-		return out
-	}
-	out := make([]probedModel, 0, len(modelsCache.models))
-	for _, model := range modelsCache.models {
-		if model.Available {
-			out = append(out, model)
+func normalizeModelNames(models []string) []string {
+	seen := make(map[string]struct{}, len(models))
+	out := make([]string, 0, len(models))
+	for _, model := range models {
+		model = strings.TrimSpace(model)
+		if model == "" {
+			continue
 		}
-	}
-	if len(out) == 0 {
-		out = append(out, probedModel{ID: "auto", Object: "model", OwnedBy: "chatgpt-web", Available: true})
+		if _, ok := seen[model]; ok {
+			continue
+		}
+		seen[model] = struct{}{}
+		out = append(out, model)
 	}
 	return out
 }
 
-func setModelProbeResults(results []probedModel) {
-	modelsCache.mu.Lock()
-	defer modelsCache.mu.Unlock()
-	modelsCache.models = results
-	modelsCache.updatedAt = time.Now().Unix()
-}
-
-func getModelProbeResults() ([]probedModel, int64) {
-	modelsCache.mu.RLock()
-	defer modelsCache.mu.RUnlock()
-	out := make([]probedModel, len(modelsCache.models))
-	copy(out, modelsCache.models)
-	return out, modelsCache.updatedAt
-}
-
-func probeModelAvailability(c *gin.Context, model string) probedModel {
-	result := probedModel{ID: model, Object: "model", OwnedBy: "chatgpt-web"}
-	backend, err := chatgpt_backend.New(c.Request.Header.Get("Authorization"), chatgpt_backend.Retry())
-	if err != nil {
-		result.Reason = err.Error()
-		return result
+func selectedModelsPayload(models []string) []gin.H {
+	data := make([]gin.H, 0, len(models))
+	for _, model := range normalizeModelNames(models) {
+		data = append(data, gin.H{
+			"id":       model,
+			"object":   "model",
+			"owned_by": "chatgpt-web",
+		})
 	}
+	return data
+}
+
+func buildAccountProbeClient(token string, proxy string) (*chatgpt_backend.Client, error) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return nil, fmt.Errorf("account access_token is empty")
+	}
+	return chatgpt_backend.NewExplicit("Bearer "+token, strings.TrimSpace(proxy))
+}
+
+func probeModelAvailabilityWithClient(backend *chatgpt_backend.Client, model string) probedModel {
+	result := probedModel{ID: model, Object: "model", OwnedBy: "chatgpt-web"}
 	req := completions.BuildChatRequest(&completions.ApiReq{
 		Model: model,
 		Messages: []completions.ApiMessage{{
@@ -147,15 +141,7 @@ func probeModelAvailability(c *gin.Context, model string) probedModel {
 }
 
 func ModelsList(c *gin.Context) {
-	models := cachedAvailableModels()
-	data := make([]gin.H, 0, len(models))
-	for _, model := range models {
-		data = append(data, gin.H{
-			"id":       model.ID,
-			"object":   model.Object,
-			"owned_by": model.OwnedBy,
-		})
-	}
+	data := selectedModelsPayload(conf.GetApp().SummaryModels())
 	c.JSON(http.StatusOK, gin.H{
 		"object": "list",
 		"data":   data,
@@ -163,10 +149,23 @@ func ModelsList(c *gin.Context) {
 }
 
 func AdminProbeModels(c *gin.Context) {
+	req := adminProbeModelsRequest{}
+	jb := result.New(c, "admin_probe_models")
+	if jb.BindJson(&req) {
+		return
+	}
+	if strings.TrimSpace(req.AccountID) == "" {
+		jb.Error(fmt.Errorf("account_id is required"))
+		return
+	}
+	backend, err := buildAccountProbeClient(req.AccessToken, req.Proxy)
+	if jb.AssertError(err) {
+		return
+	}
 	candidates := defaultModelCandidates()
 	results := make([]probedModel, 0, len(candidates))
 	for _, candidate := range candidates {
-		results = append(results, probeModelAvailability(c, strings.TrimSpace(candidate)))
+		results = append(results, probeModelAvailabilityWithClient(backend, strings.TrimSpace(candidate)))
 	}
 	sort.Slice(results, func(i, j int) bool {
 		if results[i].Available == results[j].Available {
@@ -174,24 +173,26 @@ func AdminProbeModels(c *gin.Context) {
 		}
 		return results[i].Available && !results[j].Available
 	})
-	setModelProbeResults(results)
-	_, updatedAt := getModelProbeResults()
-	result.New(c, "admin_probe_models").AssertSuccessful(gin.H{
-		"models":      results,
-		"updated_at":  updatedAt,
-		"available":   countAvailableModels(results),
-		"total":       len(results),
-	}, nil)
+	jb.Data = gin.H{
+		"account_id":       strings.TrimSpace(req.AccountID),
+		"models":           results,
+		"available":        countAvailableModels(results),
+		"total":            len(results),
+		"available_models": extractAvailableModelIDs(results),
+	}
+	jb.Successful()
 }
 
 func AdminGetModels(c *gin.Context) {
-	models, updatedAt := getModelProbeResults()
-	result.New(c, "admin_get_models").AssertSuccessful(gin.H{
-		"models":     models,
-		"updated_at": updatedAt,
-		"available":  countAvailableModels(models),
-		"total":      len(models),
-	}, nil)
+	snapshot, err := conf.AdminSnapshot()
+	jb := result.New(c, "admin_get_models")
+	if jb.AssertError(err) {
+		return
+	}
+	jb.Data = gin.H{
+		"summary_models": snapshot.SummaryModels,
+	}
+	jb.Successful()
 }
 
 func countAvailableModels(models []probedModel) int {
@@ -202,4 +203,14 @@ func countAvailableModels(models []probedModel) int {
 		}
 	}
 	return count
+}
+
+func extractAvailableModelIDs(models []probedModel) []string {
+	out := make([]string, 0, len(models))
+	for _, model := range models {
+		if model.Available {
+			out = append(out, model.ID)
+		}
+	}
+	return normalizeModelNames(out)
 }

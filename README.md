@@ -8,7 +8,7 @@
 
 - `POST /v1/chat/completions`：兼容 Chat Completions，请求支持普通 JSON 与 stream。
 - `POST /v1/responses`：兼容 Responses API 文本链路，请求支持普通 JSON 与 stream。
-- `GET /v1/models`：返回后台最近一次模型探测得到的可用模型列表；未探测时默认返回 `auto`。这是本地缓存结果，不是 ChatGPT 网页官方实时模型枚举接口。
+- `GET /v1/models`：返回后台配置里所有启用账号的 `selected_models` 去重汇总结果；未配置时默认返回 `auto`。
 - Function Calling：兼容 OpenAI `tools`/`tool_choice`、旧版 `functions`/`function_call`，支持多工具调用、工具结果回填与流式 tool calls。
 - `GET /v1/accTokens`：查看配置账号池可用数量。
 - 本地 `sk-` auth key：使用配置文件中的 `chatgpts` 账号池请求上游。
@@ -32,7 +32,12 @@
 
 后台管理界面：访问 `/admin`。在 Render 等云平台部署时，只需要先配置后台登录环境变量，登录后即可在页面里维护本地 API key、直传前缀、上游 ChatGPT token、代理和 base URL。
 
-后台还提供“模型探测”按钮：会批量测试常见模型 slug 是否可被当前网页版账号接受，并把结果缓存下来供 `/v1/models` 返回。
+后台支持按账号单独“探测模型”：先对某个上游账号测试常见模型 slug，再从该账号的可用模型里手工勾选要启用的模型。最后 `/v1/models` 返回所有启用账号 `selected_models` 的去重汇总。
+
+上游账号池支持两种调度模式：
+
+- `round_robin`：只使用 `enabled=true` 的账号，并按 `priority` 从小到大进入轮询队列。
+- `single`：只使用 `account_routing.selected_account` 指定的那个账号；可填账号 `id`，也兼容邮箱、`account_id` 或该账号的 `access_token`。
 
 | 环境变量 | 作用 |
 | --- | --- |
@@ -75,8 +80,15 @@ auth:
 proxy: http://127.0.0.1:7890
 chatgpt_base_url: https://chatgpt.com
 
+account_routing:
+  mode: round_robin
+  selected_account: ""
+
 chatgpts:
-  - id_token: optional_id_token
+  - id: primary-web
+    enabled: true
+    priority: 0
+    id_token: optional_id_token
     access_token: real_access_token
     refresh_token: optional_refresh_token
     account_id: optional_account_id
@@ -85,6 +97,12 @@ chatgpts:
     type: codex
     expired: ""
     proxy: ""
+    available_models:
+      - auto
+      - gpt-4o
+    selected_models:
+      - auto
+      - gpt-4o
 ```
 
 关键规则：
@@ -93,6 +111,11 @@ chatgpts:
 - `auth.access_token_prefix` 配置直传真实 access token 的前缀；默认空列表会关闭直传模式。启用后，请求头里的 `Bearer <prefix><real_access_token>` 会跳过账号池，并把去掉 `<prefix>` 后的真实 access token 传给上游。前缀务必使用私有且难猜的值。
 - 如果 `auth.access_tokens` 为空，服务启动时会随机生成一个 `sk-` token，写回配置文件，并在日志中打印 `current auth: ...`。
 - `chatgpts` 是账号池配置，每个账号只有 `access_token` 是必要配置；`proxy`、`id_token`、`refresh_token`、`email` 等字段都是可选字段。
+- `chatgpts[].enabled=false` 的账号不会进入运行时账号池。
+- `chatgpts[].priority` 越小，轮询时越靠前。
+- `chatgpts[].id` 建议显式填写，便于在 `single` 模式下稳定选中指定账号。
+- `chatgpts[].available_models` 是这个账号最近一次探测得到的可用模型候选。
+- `chatgpts[].selected_models` 才是真正参与 `/v1/models` 汇总输出的模型列表。
 - `chatgpts[].access_token` 是账号池的真实上游 access token。通过本地 `sk-` key 请求时会从这里选择账号。
 - 代理优先级为账号代理优先：`chatgpts[].proxy` 不为空时使用账号代理；为空时回退到全局 `proxy`。
 - `chatgpt_base_url` 为空时默认使用 `https://chatgpt.com`。

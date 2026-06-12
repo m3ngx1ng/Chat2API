@@ -20,6 +20,11 @@ var (
 var ErrConfigReadonly = errors.New("current runtime is not backed by a writable config file")
 
 type AdminChatGPTAccount struct {
+	ID           string `json:"id"`
+	Enabled      bool   `json:"enabled"`
+	Priority     int    `json:"priority"`
+	AvailableModels []string `json:"available_models"`
+	SelectedModels  []string `json:"selected_models"`
 	IdToken      string `json:"id_token"`
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
@@ -38,6 +43,9 @@ type AdminConfigSnapshot struct {
 	RuntimePort         uint16                `json:"runtime_port"`
 	Proxy               string                `json:"proxy"`
 	ChatGPTBaseURL      string                `json:"chatgpt_base_url"`
+	AccountRoutingMode  string                `json:"account_routing_mode"`
+	SelectedAccount     string                `json:"selected_account"`
+	SummaryModels       []string              `json:"summary_models"`
 	AuthTokens          []string              `json:"auth_tokens"`
 	AccessTokenPrefixes []string              `json:"access_token_prefixes"`
 	ChatGPTAccounts     []AdminChatGPTAccount `json:"chatgpt_accounts"`
@@ -46,6 +54,8 @@ type AdminConfigSnapshot struct {
 type AdminConfigUpdate struct {
 	Proxy               string                `json:"proxy"`
 	ChatGPTBaseURL      string                `json:"chatgpt_base_url"`
+	AccountRoutingMode  string                `json:"account_routing_mode"`
+	SelectedAccount     string                `json:"selected_account"`
 	AuthTokens          []string              `json:"auth_tokens"`
 	AccessTokenPrefixes []string              `json:"access_token_prefixes"`
 	ChatGPTAccounts     []AdminChatGPTAccount `json:"chatgpt_accounts"`
@@ -79,6 +89,9 @@ func AdminSnapshot() (*AdminConfigSnapshot, error) {
 		RuntimePort:         runtimeCfg.Port,
 		Proxy:               persistedCfg.Proxy,
 		ChatGPTBaseURL:      persistedCfg.ChatGPTBaseUrl,
+		AccountRoutingMode:  persistedCfg.ChatGPTRoutingMode(),
+		SelectedAccount:     strings.TrimSpace(persistedCfg.AccountRouting.SelectedAccount),
+		SummaryModels:       persistedCfg.SummaryModels(),
 		AuthTokens:          cloneStrings(persistedCfg.Auth.AccessTokens),
 		AccessTokenPrefixes: cloneStrings(persistedCfg.Auth.AccessTokenPrefix),
 		ChatGPTAccounts:     adminAccountsFromConfig(persistedCfg.ChatGPTs),
@@ -99,6 +112,8 @@ func SaveAdminConfig(input AdminConfigUpdate) error {
 
 	persistedCfg.Proxy = strings.TrimSpace(input.Proxy)
 	persistedCfg.ChatGPTBaseUrl = strings.TrimSpace(input.ChatGPTBaseURL)
+	persistedCfg.AccountRouting.Mode = normalizeAccountRoutingMode(input.AccountRoutingMode)
+	persistedCfg.AccountRouting.SelectedAccount = strings.TrimSpace(input.SelectedAccount)
 	persistedCfg.Auth.AccessTokens = nonEmptyAuthTokens(input.AuthTokens)
 	persistedCfg.Auth.AccessTokenPrefix = nonEmptyAccessTokenPrefixes(input.AccessTokenPrefixes)
 	persistedCfg.ChatGPTs = adminAccountsToConfig(input.ChatGPTAccounts)
@@ -110,6 +125,9 @@ func SaveAdminConfig(input AdminConfigUpdate) error {
 	runtimeCfg := persistedCfg
 	applyRuntimeOverrides(&runtimeCfg)
 	normalizeConfig(&runtimeCfg)
+	if err := validateAccountRouting(runtimeCfg); err != nil {
+		return err
+	}
 	setApp(runtimeCfg)
 	logCurrentAuth(context.Background(), runtimeCfg)
 	return nil
@@ -154,6 +172,11 @@ func adminAccountsFromConfig(accounts []chatgpt) []AdminChatGPTAccount {
 			continue
 		}
 		items = append(items, AdminChatGPTAccount{
+			ID:           account.Selector(),
+			Enabled:      account.IsEnabled(),
+			Priority:     account.Priority,
+			AvailableModels: normalizeModelNames(account.AvailableModels),
+			SelectedModels:  normalizeModelNames(account.SelectedModels),
 			IdToken:      strings.TrimSpace(account.IdToken),
 			AccessToken:  normalizeAuthToken(account.AccessToken),
 			RefreshToken: strings.TrimSpace(account.RefreshToken),
@@ -171,7 +194,13 @@ func adminAccountsFromConfig(accounts []chatgpt) []AdminChatGPTAccount {
 func adminAccountsToConfig(accounts []AdminChatGPTAccount) []chatgpt {
 	items := make([]chatgpt, 0, len(accounts))
 	for _, account := range accounts {
+		enabled := account.Enabled
 		normalized := chatgpt{
+			ID:           strings.TrimSpace(account.ID),
+			Enabled:      &enabled,
+			Priority:     account.Priority,
+			AvailableModels: normalizeModelNames(account.AvailableModels),
+			SelectedModels:  normalizeModelNames(account.SelectedModels),
 			IdToken:      strings.TrimSpace(account.IdToken),
 			AccessToken:  normalizeAuthToken(account.AccessToken),
 			RefreshToken: strings.TrimSpace(account.RefreshToken),
@@ -181,6 +210,9 @@ func adminAccountsToConfig(accounts []AdminChatGPTAccount) []chatgpt {
 			Type:         strings.TrimSpace(account.Type),
 			Expired:      strings.TrimSpace(account.Expired),
 			Proxy:        strings.TrimSpace(account.Proxy),
+		}
+		if normalized.ID == "" {
+			normalized.ID = normalized.Selector()
 		}
 		if normalized.AccessToken == "" &&
 			normalized.Proxy == "" &&

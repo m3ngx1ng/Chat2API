@@ -76,6 +76,10 @@ func New(token string, retry int) (*Client, error) {
 	return client, err
 }
 
+func NewExplicit(token string, accountProxy string) (*Client, error) {
+	return newClient(strings.TrimSpace(token), strings.TrimSpace(accountProxy))
+}
+
 func newClient(token string, accountProxy string) (*Client, error) {
 	appConf := conf.GetApp()
 	baseURL := strings.TrimRight(appConf.ChatGPTBaseUrl, "/")

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -154,6 +155,7 @@ func defaultGeneratedApp(curr env.Env) app {
 		Auth:           auth{AccessTokens: []string{}, AccessTokenPrefix: []string{}},
 		Proxy:          "",
 		ChatGPTBaseUrl: "https://chatgpt.com",
+		AccountRouting: accountRouting{Mode: AccountRoutingModeRoundRobin},
 		ChatGPTs:       []chatgpt{},
 	}
 }
@@ -234,9 +236,11 @@ func normalizeConfig(cfg *app) {
 		cfg.Auth.AccessTokens[i] = normalizeAuthToken(token)
 	}
 	cfg.Auth.AccessTokenPrefix = nonEmptyAccessTokenPrefixes(cfg.Auth.AccessTokenPrefix)
+	cfg.AccountRouting.Mode = normalizeAccountRoutingMode(cfg.AccountRouting.Mode)
+	cfg.AccountRouting.SelectedAccount = strings.TrimSpace(cfg.AccountRouting.SelectedAccount)
 	pool := token_pool.GetAccessTokenPool()
 	pool.Reset()
-	for _, account := range cfg.ChatGPTs {
+	for _, account := range selectedChatGPTAccounts(*cfg) {
 		token := strings.TrimSpace(account.AccessToken)
 		token = strings.TrimPrefix(token, "Bearer ")
 		if token == "" {
@@ -432,6 +436,9 @@ func Init(ctx context.Context) func(context.Context) {
 		}
 		applyRuntimeOverrides(&next)
 		normalizeConfig(&next)
+		if err := validateAccountRouting(next); err != nil {
+			return err
+		}
 		if err := logx.Configure(next.LogLevel, next.LogPath, next.LogFile); err != nil {
 			return err
 		}
@@ -474,6 +481,9 @@ func InitServerless(ctx context.Context) func(context.Context) {
 	applyRuntimeOverrides(&next)
 	next.Auth.AccessTokens = nonEmptyAuthTokens(next.Auth.AccessTokens)
 	normalizeConfig(&next)
+	if err := validateAccountRouting(next); err != nil {
+		logx.WithContext(ctx).Fatalf("validate config failed: %+v", err)
+	}
 	if err := logx.Configure(next.LogLevel, next.LogPath, ""); err != nil {
 		logx.WithContext(ctx).Fatalf("configure log failed: %+v", err)
 	}
@@ -511,6 +521,73 @@ func applyEnvOverrides(cfg *app) {
 	if value := strings.TrimSpace(os.Getenv("LOG_LEVEL")); value != "" {
 		cfg.LogLevel = value
 	}
+}
+
+func selectedChatGPTAccounts(cfg app) []chatgpt {
+	type indexedAccount struct {
+		order   int
+		account chatgpt
+	}
+
+	accounts := make([]indexedAccount, 0, len(cfg.ChatGPTs))
+	for index, account := range cfg.ChatGPTs {
+		if !account.IsEnabled() {
+			continue
+		}
+		account.AccessToken = normalizedAccessToken(account.AccessToken)
+		if account.AccessToken == "" {
+			continue
+		}
+		if strings.TrimSpace(account.ID) == "" {
+			account.ID = account.Selector()
+		}
+		accounts = append(accounts, indexedAccount{order: index, account: account})
+	}
+
+	if cfg.ChatGPTRoutingMode() == AccountRoutingModeSingle {
+		selector := strings.TrimSpace(cfg.AccountRouting.SelectedAccount)
+		for _, item := range accounts {
+			if item.account.MatchesSelector(selector) {
+				return []chatgpt{item.account}
+			}
+		}
+		return []chatgpt{}
+	}
+
+	sort.SliceStable(accounts, func(i, j int) bool {
+		if accounts[i].account.Priority != accounts[j].account.Priority {
+			return accounts[i].account.Priority < accounts[j].account.Priority
+		}
+		return accounts[i].order < accounts[j].order
+	})
+
+	out := make([]chatgpt, 0, len(accounts))
+	for _, item := range accounts {
+		out = append(out, item.account)
+	}
+	return out
+}
+
+func validateAccountRouting(cfg app) error {
+	if cfg.ChatGPTRoutingMode() != AccountRoutingModeSingle {
+		return nil
+	}
+	selector := strings.TrimSpace(cfg.AccountRouting.SelectedAccount)
+	if selector == "" {
+		return fmt.Errorf("single account mode requires selected_account")
+	}
+	for _, account := range cfg.ChatGPTs {
+		if !account.IsEnabled() {
+			continue
+		}
+		if normalizedAccessToken(account.AccessToken) == "" {
+			continue
+		}
+		if account.MatchesSelector(selector) {
+			return nil
+		}
+	}
+	return fmt.Errorf("selected_account does not match any enabled chatgpt account")
 }
 
 func applyRuntimeOverrides(cfg *app) {

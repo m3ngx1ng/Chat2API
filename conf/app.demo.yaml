@@ -26,11 +26,22 @@ proxy: http://127.0.0.1:7890
 # Upstream ChatGPT base URL. Empty value defaults to https://chatgpt.com.
 chatgpt_base_url: https://chatgpt.com
 
+# Upstream account routing mode.
+# mode: round_robin | single
+# round_robin: rotate enabled accounts by priority ascending.
+# single: only use the account matched by selected_account.
+account_routing:
+  mode: round_robin
+  selected_account: ""
+
 # Account pool used by local sk-* auth keys.
 # Required field per account: access_token.
 # Other fields are optional metadata or auxiliary settings.
 chatgpts:
-  - id_token: optional_id_token_1
+  - id: primary-web
+    enabled: true
+    priority: 0
+    id_token: optional_id_token_1
     access_token: real_access_token_1
     refresh_token: optional_refresh_token_1
     account_id: optional_account_id_1
@@ -39,9 +50,17 @@ chatgpts:
     type: codex
     expired: ""
     proxy: ""
+    available_models:
+      - auto
+      - gpt-4o
+    selected_models:
+      - auto
 
   # Optional second account. This account uses its own proxy instead of the global proxy.
-  - id_token: optional_id_token_2
+  - id: backup-web
+    enabled: true
+    priority: 10
+    id_token: optional_id_token_2
     access_token: real_access_token_2
     refresh_token: optional_refresh_token_2
     account_id: optional_account_id_2
@@ -50,3 +69,5 @@ chatgpts:
     type: codex
     expired: ""
     proxy: http://127.0.0.1:7891
+    available_models: []
+    selected_models: []
