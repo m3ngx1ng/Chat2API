@@ -26,6 +26,22 @@
 | 环境变量 | 默认值 | 作用 |
 | --- | --- | --- |
 | `ENV` | `dev` | 决定读取哪个配置文件，例如 `ENV=prod` 会读取 `conf/app.prod.yaml`。 |
+| `CONFIG_DIR` | 空 | 可选，优先指定配置目录；服务会在该目录读取/创建 `app.<ENV>.yaml` |
+| `RENDER_DISK_MOUNT_PATH` | 空 | 可选，Render 持久磁盘挂载目录；未设置 `CONFIG_DIR` 时会用它作为配置目录 |
+
+后台管理界面：访问 `/admin`。在 Render 等云平台部署时，只需要先配置后台登录环境变量，登录后即可在页面里维护本地 API key、直传前缀、上游 ChatGPT token、代理和 base URL。
+
+| 环境变量 | 作用 |
+| --- | --- |
+| `ADMIN_USERNAME` | 后台登录用户名 |
+| `ADMIN_PASSWORD` | 后台登录密码，必须使用强随机值 |
+
+Render 持久化建议：
+
+1. 在 Render 创建 Persistent Disk，例如挂载到 `/var/data/chat2api`
+2. 设置环境变量 `CONFIG_DIR=/var/data/chat2api`
+3. 后台在 `/admin` 中保存的配置会优先写入 `/var/data/chat2api/app.<ENV>.yaml`
+4. 不设置 `CONFIG_DIR` 时，如果存在 `RENDER_DISK_MOUNT_PATH`，服务会自动把它当作配置目录
 
 补充：在 `Render` 等 PaaS 平台上，服务会优先读取运行时环境变量 `PORT` 与可选的 `BIND`/`HOST`；当检测到 `PORT` 且当前仍配置为本地回环地址时，会自动切换为 `0.0.0.0` 监听，避免平台端口探测失败。
 

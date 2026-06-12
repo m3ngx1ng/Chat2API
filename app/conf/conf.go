@@ -178,6 +178,43 @@ func ensureConfigFile(ctx context.Context, path string, curr env.Env) error {
 	return nil
 }
 
+func resolveConfigPath() (string, error) {
+	if path := strings.TrimSpace(os.Getenv("VERCEL_CONFIG_FILE")); path != "" {
+		if filepath.IsAbs(path) {
+			return path, nil
+		}
+		wd, err := os.Getwd()
+		if err != nil {
+			return "", err
+		}
+		return filepath.Join(wd, path), nil
+	}
+
+	configFile := fmt.Sprintf("app.%s.yaml", env.Curr)
+	for _, dir := range []string{
+		strings.TrimSpace(os.Getenv("CONFIG_DIR")),
+		strings.TrimSpace(os.Getenv("RENDER_DISK_MOUNT_PATH")),
+	} {
+		if dir == "" {
+			continue
+		}
+		if filepath.IsAbs(dir) {
+			return filepath.Join(dir, configFile), nil
+		}
+		wd, err := os.Getwd()
+		if err != nil {
+			return "", err
+		}
+		return filepath.Join(wd, dir, configFile), nil
+	}
+
+	wd, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(wd, "conf", configFile), nil
+}
+
 func ensureAuthTokens(path string, cfg *app) error {
 	if len(nonEmptyAuthTokens(cfg.Auth.AccessTokens)) > 0 {
 		cfg.Auth.AccessTokens = nonEmptyAuthTokens(cfg.Auth.AccessTokens)
@@ -377,8 +414,11 @@ func setMappingChild(root *yaml.Node, key string, value *yaml.Node) {
 }
 
 func Init(ctx context.Context) func(context.Context) {
-	wd, _ := os.Getwd()
-	path := filepath.Join(wd, "conf", fmt.Sprintf("app.%s.yaml", env.Curr))
+	path, err := resolveConfigPath()
+	if err != nil {
+		logx.WithContext(ctx).Fatalf("resolve config path failed: %+v", err)
+	}
+	setCurrentConfigPath(path)
 	if err := ensureConfigFile(ctx, path, env.Curr); err != nil {
 		logx.WithContext(ctx).Fatalf("generate config failed: %+v", err)
 	}
@@ -413,11 +453,14 @@ func Init(ctx context.Context) func(context.Context) {
 
 func InitServerless(ctx context.Context) func(context.Context) {
 	next := defaultGeneratedApp(env.Curr)
+	setCurrentConfigPath("")
 	if path := strings.TrimSpace(os.Getenv("VERCEL_CONFIG_FILE")); path != "" {
-		if !filepath.IsAbs(path) {
-			wd, _ := os.Getwd()
-			path = filepath.Join(wd, path)
+		resolvedPath, err := resolveConfigPath()
+		if err != nil {
+			logx.WithContext(ctx).Fatalf("resolve config path failed: %+v", err)
 		}
+		path = resolvedPath
+		setCurrentConfigPath(path)
 		data, err := os.ReadFile(path)
 		if err != nil {
 			logx.WithContext(ctx).Fatalf("load config failed: %+v", err)
