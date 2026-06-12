@@ -108,6 +108,8 @@ func NewEngine() *gin.Engine {
 	adminRouter.GET("/session", service.AdminSession)
 	adminRouter.GET("/config", service.AdminGetConfig)
 	adminRouter.PUT("/config", service.AdminSaveConfig)
+	adminRouter.GET("/config/export", service.AdminExportConfig)
+	adminRouter.POST("/config/import", service.AdminImportConfig)
 	adminRouter.GET("/models", service.AdminGetModels)
 	adminRouter.POST("/models/probe", service.AdminProbeModels)
 	v1Router := engine.Group("/v1")

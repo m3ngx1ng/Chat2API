@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -20,20 +21,20 @@ var (
 var ErrConfigReadonly = errors.New("current runtime is not backed by a writable config file")
 
 type AdminChatGPTAccount struct {
-	ID           string `json:"id"`
-	Enabled      bool   `json:"enabled"`
-	Priority     int    `json:"priority"`
+	ID              string   `json:"id"`
+	Enabled         bool     `json:"enabled"`
+	Priority        int      `json:"priority"`
 	AvailableModels []string `json:"available_models"`
 	SelectedModels  []string `json:"selected_models"`
-	IdToken      string `json:"id_token"`
-	AccessToken  string `json:"access_token"`
-	RefreshToken string `json:"refresh_token"`
-	AccountID    string `json:"account_id"`
-	LastRefresh  string `json:"last_refresh"`
-	Email        string `json:"email"`
-	Type         string `json:"type"`
-	Expired      string `json:"expired"`
-	Proxy        string `json:"proxy"`
+	IdToken         string   `json:"id_token"`
+	AccessToken     string   `json:"access_token"`
+	RefreshToken    string   `json:"refresh_token"`
+	AccountID       string   `json:"account_id"`
+	LastRefresh     string   `json:"last_refresh"`
+	Email           string   `json:"email"`
+	Type            string   `json:"type"`
+	Expired         string   `json:"expired"`
+	Proxy           string   `json:"proxy"`
 }
 
 type AdminConfigSnapshot struct {
@@ -117,15 +118,58 @@ func SaveAdminConfig(input AdminConfigUpdate) error {
 	persistedCfg.Auth.AccessTokens = nonEmptyAuthTokens(input.AuthTokens)
 	persistedCfg.Auth.AccessTokenPrefix = nonEmptyAccessTokenPrefixes(input.AccessTokenPrefixes)
 	persistedCfg.ChatGPTs = adminAccountsToConfig(input.ChatGPTAccounts)
-
-	if err := saveFullConfig(path, persistedCfg); err != nil {
-		return err
-	}
+	normalizeConfig(&persistedCfg)
 
 	runtimeCfg := persistedCfg
 	applyRuntimeOverrides(&runtimeCfg)
-	normalizeConfig(&runtimeCfg)
 	if err := validateAccountRouting(runtimeCfg); err != nil {
+		return err
+	}
+	if err := saveFullConfig(path, persistedCfg); err != nil {
+		return err
+	}
+	setApp(runtimeCfg)
+	logCurrentAuth(context.Background(), runtimeCfg)
+	return nil
+}
+
+func ExportAdminConfig() (string, []byte, error) {
+	_, path, writable, err := readPersistedConfig()
+	if err != nil {
+		return "", nil, err
+	}
+	if !writable {
+		return "", nil, ErrConfigReadonly
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", nil, err
+	}
+	return filepath.Base(path), data, nil
+}
+
+func ImportAdminConfig(data []byte) error {
+	adminConfigMu.Lock()
+	defer adminConfigMu.Unlock()
+
+	_, path, writable, err := readPersistedConfig()
+	if err != nil {
+		return err
+	}
+	if !writable {
+		return ErrConfigReadonly
+	}
+	persistedCfg := defaultGeneratedApp(env.Curr)
+	if err := yaml.Unmarshal(data, &persistedCfg); err != nil {
+		return err
+	}
+	normalizeConfig(&persistedCfg)
+	runtimeCfg := persistedCfg
+	applyRuntimeOverrides(&runtimeCfg)
+	if err := validateAccountRouting(runtimeCfg); err != nil {
+		return err
+	}
+	if err := saveFullConfig(path, persistedCfg); err != nil {
 		return err
 	}
 	setApp(runtimeCfg)
@@ -172,20 +216,20 @@ func adminAccountsFromConfig(accounts []chatgpt) []AdminChatGPTAccount {
 			continue
 		}
 		items = append(items, AdminChatGPTAccount{
-			ID:           account.Selector(),
-			Enabled:      account.IsEnabled(),
-			Priority:     account.Priority,
+			ID:              account.Selector(),
+			Enabled:         account.IsEnabled(),
+			Priority:        account.Priority,
 			AvailableModels: normalizeModelNames(account.AvailableModels),
 			SelectedModels:  normalizeModelNames(account.SelectedModels),
-			IdToken:      strings.TrimSpace(account.IdToken),
-			AccessToken:  normalizeAuthToken(account.AccessToken),
-			RefreshToken: strings.TrimSpace(account.RefreshToken),
-			AccountID:    strings.TrimSpace(account.AccountId),
-			LastRefresh:  strings.TrimSpace(account.LastRefresh),
-			Email:        strings.TrimSpace(account.Email),
-			Type:         strings.TrimSpace(account.Type),
-			Expired:      strings.TrimSpace(account.Expired),
-			Proxy:        strings.TrimSpace(account.Proxy),
+			IdToken:         strings.TrimSpace(account.IdToken),
+			AccessToken:     normalizeAuthToken(account.AccessToken),
+			RefreshToken:    strings.TrimSpace(account.RefreshToken),
+			AccountID:       strings.TrimSpace(account.AccountId),
+			LastRefresh:     strings.TrimSpace(account.LastRefresh),
+			Email:           strings.TrimSpace(account.Email),
+			Type:            strings.TrimSpace(account.Type),
+			Expired:         strings.TrimSpace(account.Expired),
+			Proxy:           strings.TrimSpace(account.Proxy),
 		})
 	}
 	return items
@@ -196,20 +240,20 @@ func adminAccountsToConfig(accounts []AdminChatGPTAccount) []chatgpt {
 	for _, account := range accounts {
 		enabled := account.Enabled
 		normalized := chatgpt{
-			ID:           strings.TrimSpace(account.ID),
-			Enabled:      &enabled,
-			Priority:     account.Priority,
+			ID:              strings.TrimSpace(account.ID),
+			Enabled:         &enabled,
+			Priority:        account.Priority,
 			AvailableModels: normalizeModelNames(account.AvailableModels),
 			SelectedModels:  normalizeModelNames(account.SelectedModels),
-			IdToken:      strings.TrimSpace(account.IdToken),
-			AccessToken:  normalizeAuthToken(account.AccessToken),
-			RefreshToken: strings.TrimSpace(account.RefreshToken),
-			AccountId:    strings.TrimSpace(account.AccountID),
-			LastRefresh:  strings.TrimSpace(account.LastRefresh),
-			Email:        strings.TrimSpace(account.Email),
-			Type:         strings.TrimSpace(account.Type),
-			Expired:      strings.TrimSpace(account.Expired),
-			Proxy:        strings.TrimSpace(account.Proxy),
+			IdToken:         strings.TrimSpace(account.IdToken),
+			AccessToken:     normalizeAuthToken(account.AccessToken),
+			RefreshToken:    strings.TrimSpace(account.RefreshToken),
+			AccountId:       strings.TrimSpace(account.AccountID),
+			LastRefresh:     strings.TrimSpace(account.LastRefresh),
+			Email:           strings.TrimSpace(account.Email),
+			Type:            strings.TrimSpace(account.Type),
+			Expired:         strings.TrimSpace(account.Expired),
+			Proxy:           strings.TrimSpace(account.Proxy),
 		}
 		if normalized.ID == "" {
 			normalized.ID = normalized.Selector()

@@ -3,6 +3,7 @@ package service
 import (
 	"chat2api/app/conf"
 	"chat2api/app/result"
+	"io"
 	"net/http"
 	"strings"
 
@@ -80,6 +81,37 @@ func AdminSaveConfig(c *gin.Context) {
 	jb.Successful()
 }
 
+func AdminExportConfig(c *gin.Context) {
+	filename, data, err := conf.ExportAdminConfig()
+	if result.New(c, "admin_export_config").AssertError(err) {
+		return
+	}
+	c.Header("Content-Disposition", "attachment; filename=\""+filename+"\"")
+	c.Data(http.StatusOK, "application/x-yaml; charset=utf-8", data)
+}
+
+func AdminImportConfig(c *gin.Context) {
+	file, err := c.FormFile("file")
+	jb := result.New(c, "admin_import_config")
+	if jb.AssertError(err) {
+		return
+	}
+	stream, err := file.Open()
+	if jb.AssertError(err) {
+		return
+	}
+	defer stream.Close()
+	data, err := io.ReadAll(stream)
+	if jb.AssertError(err) {
+		return
+	}
+	if err := conf.ImportAdminConfig(data); jb.AssertError(err) {
+		return
+	}
+	jb.Data = gin.H{"imported": true}
+	jb.Successful()
+}
+
 const adminPageHTML = `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -95,7 +127,7 @@ const adminPageHTML = `<!doctype html>
   <div class="shell">
     <section class="hero"><div class="hero-grid"><div><h1 class="title">chat2api Admin</h1><p class="subtitle">Render 只需要配置后台账号密码。登录后台后，可以管理本地 API keys、直传前缀、上游 ChatGPT 账号池和全局代理配置。</p></div><div class="login-panel"><h2>后台登录</h2><p>使用 Render 环境变量 ADMIN_USERNAME 和 ADMIN_PASSWORD 登录。</p><div class="field"><label for="username">Username</label><input id="username" autocomplete="username" placeholder="admin"></div><div class="field" style="margin-top:10px"><label for="password">Password</label><input id="password" type="password" autocomplete="current-password" placeholder="password"></div><div class="toolbar" style="margin-top:12px"><button class="btn btn-primary" id="loginBtn">登录</button><button class="btn btn-secondary" id="logoutBtn">退出</button></div><div class="status" id="heroStatus" style="margin-top:12px">未登录</div></div></div></section>
     <main id="adminApp" class="hidden">
-      <section class="section"><div class="section-header"><div class="section-copy"><h2>运行状态</h2><p>配置改动会写回当前 YAML 文件，并即时刷新内存中的 token 池。Render 如果没有挂持久磁盘，重建实例后文件改动可能丢失。</p></div><button class="btn btn-primary" id="saveBtn">保存全部配置</button></div><div class="stats"><div class="stat"><div class="label">本地 API Keys</div><div class="value" id="statAuth">0</div></div><div class="stat"><div class="label">直传前缀</div><div class="value" id="statPrefixes">0</div></div><div class="stat"><div class="label">上游账号</div><div class="value" id="statAccounts">0</div></div><div class="stat"><div class="label">可写配置</div><div class="value" id="statWritable">否</div></div></div><div class="meta-grid"><div class="meta"><div class="label">Config Path</div><div class="value" id="configPath">未加载</div></div><div class="meta"><div class="label">Runtime Bind</div><div class="value" id="runtimeBind">未加载</div></div></div><p class="note">高危提示：这里会显示和保存真实 token。只在可信网络和 HTTPS 下使用，后台密码必须足够强。</p></section>
+      <section class="section"><div class="section-header"><div class="section-copy"><h2>运行状态</h2><p>配置改动会写回当前 YAML 文件，并即时刷新内存中的 token 池。Render 如果没有挂持久磁盘，重建实例后文件改动可能丢失。</p></div><div class="toolbar"><button class="btn btn-secondary" id="exportBtn">导出配置</button><label class="btn btn-secondary" for="importFile">导入配置</label><input id="importFile" type="file" accept=".yaml,.yml" class="hidden"><button class="btn btn-primary" id="saveBtn">保存全部配置</button></div></div><div class="stats"><div class="stat"><div class="label">本地 API Keys</div><div class="value" id="statAuth">0</div></div><div class="stat"><div class="label">直传前缀</div><div class="value" id="statPrefixes">0</div></div><div class="stat"><div class="label">上游账号</div><div class="value" id="statAccounts">0</div></div><div class="stat"><div class="label">可写配置</div><div class="value" id="statWritable">否</div></div></div><div class="meta-grid"><div class="meta"><div class="label">Config Path</div><div class="value" id="configPath">未加载</div></div><div class="meta"><div class="label">Runtime Bind</div><div class="value" id="runtimeBind">未加载</div></div></div><p class="note">高危提示：这里会显示和保存真实 token。只在可信网络和 HTTPS 下使用，后台密码必须足够强。</p></section>
       <section class="section"><div class="section-header"><div class="section-copy"><h2>模型汇总</h2><p>每个上游账号单独探测模型后，可以手工勾选要启用的模型。/v1/models 只返回所有账号已勾选模型的去重汇总。</p></div><div class="toolbar"><div class="status status-inline" id="modelsStatus">尚未加载</div></div></div><div class="row-list" id="modelsList"></div></section>
       <div class="grid"><section class="section" style="grid-column:span 6"><div class="section-header"><div class="section-copy"><h2>本地 API Keys</h2><p>这些 key 用于调用 /v1/*。建议至少保留一个强随机 key。</p></div><button class="btn btn-secondary" id="addAuthBtn">新增 Key</button></div><div class="row-list" id="authTokenList"></div></section><section class="section" style="grid-column:span 6"><div class="section-header"><div class="section-copy"><h2>直传 Access Token 前缀</h2><p>配置后可用 Authorization: Bearer &lt;prefix&gt;&lt;real_access_token&gt; 直接请求上游。</p></div><button class="btn btn-secondary" id="addPrefixBtn">新增前缀</button></div><div class="row-list" id="prefixList"></div></section><section class="section"><div class="section-header"><div class="section-copy"><h2>全局设置</h2><p>这里只处理业务连接配置，不保存 Render 的 PORT/BIND 临时变量。轮询模式会按优先级从小到大依次尝试账号。</p></div><div class="status status-inline" id="saveStatus">等待加载</div></div><div class="account-grid"><div class="field"><label for="globalProxy">Proxy</label><input id="globalProxy" placeholder="http://127.0.0.1:7890"></div><div class="field"><label for="globalBaseUrl">ChatGPT Base URL</label><input id="globalBaseUrl" placeholder="https://chatgpt.com"></div><div class="field"><label for="accountRoutingMode">上游账号模式</label><select id="accountRoutingMode"><option value="round_robin">轮询</option><option value="single">单一账号</option></select></div><div class="field"><label for="selectedAccount">单一账号选择</label><select id="selectedAccount"><option value="">请选择账号</option></select></div></div></section><section class="section"><div class="section-header"><div class="section-copy"><h2>上游账号池</h2><p>支持逐条增删改。只有 access_token 是必要字段。获取方式：先登录 chatgpt.com，然后打开 https://chatgpt.com/api/auth/session，复制返回 JSON 里的 accessToken 值。</p></div><div class="toolbar"><button class="btn btn-secondary" id="addAccountBtn">新增账号</button><button class="btn btn-secondary" id="importBtn">导入多条 Token</button></div></div><div class="field" style="margin-bottom:12px"><label for="bulkTokens">批量导入</label><textarea id="bulkTokens" placeholder="每行一个 token；也支持 token,proxy,email,type 四列逗号格式"></textarea></div><div class="account-list" id="accountList"></div></section></div>
     </main>
@@ -131,8 +163,10 @@ const adminPageHTML = `<!doctype html>
     async function loadConfig(){try{const r=await fetch('/admin/api/config',{credentials:'same-origin'});render(await parseResponse(r));adminApp.classList.remove('hidden');setHero('已登录','ok')}catch(e){if(String(e.message).includes('401')){adminApp.classList.add('hidden');setHero('未登录');setSave('登录后可加载配置','warn');return}setSave(e.message,'warn')}}
     async function loadModels(){try{const r=await fetch('/admin/api/models',{credentials:'same-origin'});renderModels(await parseResponse(r))}catch(e){if(String(e.message).includes('401')){setModels('登录后可查看模型汇总','warn');return}setModels(e.message,'warn')}}
     async function saveConfig(){const payload={proxy:globalProxy.value.trim(),chatgpt_base_url:globalBaseUrl.value.trim(),account_routing_mode:accountRoutingMode.value,selected_account:selectedAccount.value,auth_tokens:listValues(authTokenList),access_token_prefixes:listValues(prefixList),chatgpt_accounts:accounts()};setSave('正在保存配置...');try{const r=await fetch('/admin/api/config',{method:'PUT',headers:{'Content-Type':'application/json'},credentials:'same-origin',body:JSON.stringify(payload)});await parseResponse(r);setSave('配置已保存并刷新运行时内存','ok');await loadConfig()}catch(e){setSave(e.message,'warn')}}
+    async function exportConfig(){setSave('正在导出配置...');try{const r=await fetch('/admin/api/config/export',{credentials:'same-origin'});if(!r.ok)throw new Error('导出失败: '+r.status);const blob=await r.blob();const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='chat2api-config.yaml';document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(url);setSave('配置已导出','ok')}catch(e){setSave(e.message,'warn')}}
+    async function importConfig(file){if(!file){return}const form=new FormData();form.append('file',file);setSave('正在导入配置...');try{const r=await fetch('/admin/api/config/import',{method:'POST',credentials:'same-origin',body:form});await parseResponse(r);setSave('配置已导入并刷新运行时内存','ok');await loadConfig();await loadModels()}catch(e){setSave(e.message,'warn')}}
     function importBulk(){const raw=bulkTokens.value.trim();if(!raw){setSave('批量导入内容为空','warn');return}raw.split(/\n+/).forEach(line=>{const parts=line.trim().split(',').map(x=>x.trim());if(parts[0])addAccount({access_token:parts[0],proxy:parts[1]||'',email:parts[2]||'',type:parts[3]||'',enabled:true,priority:0})});bulkTokens.value='';setSave('批量 token 已加入待保存列表','ok')}
-    accountRoutingMode.onchange=()=>updateSelectedAccountOptions();$('loginBtn').onclick=login;$('logoutBtn').onclick=logout;$('saveBtn').onclick=saveConfig;$('addAuthBtn').onclick=()=>addAuth('');$('addPrefixBtn').onclick=()=>addPrefix('');$('addAccountBtn').onclick=()=>addAccount({enabled:true,priority:0,available_models:[],selected_models:[]});$('importBtn').onclick=importBulk;$('password').addEventListener('keydown',e=>{if(e.key==='Enter')login()});loadConfig();loadModels();ensureEmpty();updateSelectedAccountOptions();
+    accountRoutingMode.onchange=()=>updateSelectedAccountOptions();$('loginBtn').onclick=login;$('logoutBtn').onclick=logout;$('saveBtn').onclick=saveConfig;$('exportBtn').onclick=exportConfig;$('importFile').onchange=(e)=>{const file=e.target.files&&e.target.files[0];importConfig(file).finally(()=>{e.target.value=''})};$('addAuthBtn').onclick=()=>addAuth('');$('addPrefixBtn').onclick=()=>addPrefix('');$('addAccountBtn').onclick=()=>addAccount({enabled:true,priority:0,available_models:[],selected_models:[]});$('importBtn').onclick=importBulk;$('password').addEventListener('keydown',e=>{if(e.key==='Enter')login()});loadConfig();loadModels();ensureEmpty();updateSelectedAccountOptions();
   </script>
 </body>
 </html>`

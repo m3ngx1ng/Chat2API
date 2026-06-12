@@ -51,6 +51,13 @@ Render 持久化建议：
 3. 后台在 `/admin` 中保存的配置会优先写入 `/var/data/chat2api/app.<ENV>.yaml`
 4. 不设置 `CONFIG_DIR` 时，如果存在 `RENDER_DISK_MOUNT_PATH`，服务会自动把它当作配置目录
 
+后台还支持配置导出/导入：
+
+1. 在 `/admin` 点击“导出配置”，下载当前完整 YAML 配置
+2. Render 重建实例或迁移后，在新实例 `/admin` 点击“导入配置”上传该 YAML
+3. 导入成功后会立即覆盖当前配置文件并刷新运行时内存
+4. 导入/导出的是业务 YAML 配置本身，不包含 Render 运行时注入的 `PORT`、`BIND`、`HOST`、`ADMIN_USERNAME`、`ADMIN_PASSWORD` 等环境变量
+
 补充：在 `Render` 等 PaaS 平台上，服务会优先读取运行时环境变量 `PORT` 与可选的 `BIND`/`HOST`；当检测到 `PORT` 且当前仍配置为本地回环地址时，会自动切换为 `0.0.0.0` 监听，避免平台端口探测失败。
 
 常见配置文件对应关系：
