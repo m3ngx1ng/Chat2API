@@ -23,14 +23,21 @@ func completionMessagesFromResponseInput(input interface{}) []completions.ApiMes
 		}
 		return []completions.ApiMessage{{Role: "user", Content: strings.TrimSpace(v)}}
 	case map[string]interface{}:
-		return []completions.ApiMessage{{Role: responseStringValue(v["role"], "user"), Content: responseMessageContent(v)}}
+		if message, ok := responseInputMessage(v); ok {
+			return []completions.ApiMessage{message}
+		}
+		return nil
 	case []interface{}:
 		messages := make([]completions.ApiMessage, 0, len(v))
 		for _, item := range v {
-			if part, ok := item.(map[string]interface{}); ok {
-				content := responseMessageContent(part)
-				if responseContentHasValue(content) {
-					messages = append(messages, completions.ApiMessage{Role: responseStringValue(part["role"], "user"), Content: content})
+			switch part := item.(type) {
+			case string:
+				if text := strings.TrimSpace(part); text != "" {
+					messages = append(messages, completions.ApiMessage{Role: "user", Content: text})
+				}
+			case map[string]interface{}:
+				if message, ok := responseInputMessage(part); ok {
+					messages = append(messages, message)
 				}
 			}
 		}
@@ -38,6 +45,130 @@ func completionMessagesFromResponseInput(input interface{}) []completions.ApiMes
 	default:
 		return nil
 	}
+}
+
+func responseInputMessage(item map[string]interface{}) (completions.ApiMessage, bool) {
+	switch responseStringValue(item["type"], "") {
+	case "function_call":
+		return responseFunctionCallMessage(item)
+	case "function_call_output":
+		return responseFunctionCallOutputMessage(item)
+	}
+	role := responseInputRole(item)
+	if role == "" {
+		return completions.ApiMessage{}, false
+	}
+	content := responseMessageContent(item)
+	if !responseContentHasValue(content) {
+		return completions.ApiMessage{}, false
+	}
+	return completions.ApiMessage{Role: role, Content: content}, true
+}
+
+func responseFunctionCallMessage(item map[string]interface{}) (completions.ApiMessage, bool) {
+	name := strings.TrimSpace(responseStringValue(item["name"], ""))
+	if name == "" {
+		return completions.ApiMessage{}, false
+	}
+	callID := strings.TrimSpace(responseStringValue(item["call_id"], responseStringValue(item["id"], "")))
+	arguments := responseStructuredText(item["arguments"])
+	return completions.ApiMessage{
+		Role: "assistant",
+		ToolCalls: []completions.ToolCall{{
+			ID:   callID,
+			Type: "function",
+			Function: completions.ToolCallFunction{
+				Name:      name,
+				Arguments: arguments,
+			},
+		}},
+	}, true
+}
+
+func responseFunctionCallOutputMessage(item map[string]interface{}) (completions.ApiMessage, bool) {
+	callID := strings.TrimSpace(responseStringValue(item["call_id"], ""))
+	if callID == "" {
+		return completions.ApiMessage{}, false
+	}
+	content := responseFunctionOutputContent(item)
+	if !responseContentHasValue(content) {
+		return completions.ApiMessage{}, false
+	}
+	return completions.ApiMessage{Role: "tool", ToolCallID: callID, Content: content}, true
+}
+
+func responseFunctionOutputContent(item map[string]interface{}) interface{} {
+	for _, key := range []string{"output", "result", "content", "text"} {
+		value, ok := item[key]
+		if !ok {
+			continue
+		}
+		if text := responseStructuredText(value); text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+func responseStructuredText(value interface{}) string {
+	switch v := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return strings.TrimSpace(v)
+	default:
+		data, err := json.Marshal(v)
+		if err != nil {
+			return ""
+		}
+		return strings.TrimSpace(string(data))
+	}
+}
+
+func responseInputRole(item map[string]interface{}) string {
+	if role := normalizeResponseInputRole(responseStringValue(item["role"], "")); role != "" {
+		return role
+	}
+	switch responseStringValue(item["type"], "") {
+	case "input_text", "input_image", "text", "input_file":
+		return "user"
+	case "output_text", "refusal":
+		return "assistant"
+	case "message":
+		return inferResponseRoleFromContent(item["content"])
+	default:
+		return ""
+	}
+}
+
+func normalizeResponseInputRole(role string) string {
+	role = strings.TrimSpace(role)
+	switch role {
+	case "system", "developer", "user", "assistant", "tool", "function":
+		return role
+	default:
+		return ""
+	}
+}
+
+func inferResponseRoleFromContent(content interface{}) string {
+	parts, ok := content.([]interface{})
+	if !ok {
+		return ""
+	}
+	for _, raw := range parts {
+		part, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		switch responseStringValue(part["type"], "") {
+		case "output_text", "refusal":
+			return "assistant"
+		case "input_text", "input_image", "text", "input_file":
+			return "user"
+		}
+	}
+	return ""
 }
 
 func responseMessageContent(item map[string]interface{}) interface{} {
@@ -52,10 +183,31 @@ func responseContentHasValue(content interface{}) bool {
 	case string:
 		return strings.TrimSpace(v) != ""
 	case []interface{}:
-		return len(v) > 0
+		return responseContentPartsHaveValue(v)
 	default:
 		return v != nil
 	}
+}
+
+func responseContentPartsHaveValue(parts []interface{}) bool {
+	for _, raw := range parts {
+		switch part := raw.(type) {
+		case string:
+			if strings.TrimSpace(part) != "" {
+				return true
+			}
+		case map[string]interface{}:
+			switch responseStringValue(part["type"], "") {
+			case "text", "input_text", "output_text", "refusal":
+				if strings.TrimSpace(responseStringValue(part["text"], "")) != "" {
+					return true
+				}
+			case "image_url", "input_image", "image", "input_file":
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func responseMessageContentText(item map[string]interface{}) string {
@@ -79,8 +231,7 @@ func responseMessageContentText(item map[string]interface{}) string {
 	if isResponsesContentPart(item) {
 		return responseStringValue(item["text"], "")
 	}
-	data, _ := json.Marshal(item)
-	return string(data)
+	return ""
 }
 
 func isResponsesContentPart(item map[string]interface{}) bool {
