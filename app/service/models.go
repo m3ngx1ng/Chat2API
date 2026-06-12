@@ -9,6 +9,7 @@ import (
 	"chat2api/app/types/completions"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"strings"
@@ -140,6 +141,104 @@ func probeModelAvailabilityWithClient(backend *chatgpt_backend.Client, model str
 	return result
 }
 
+func fetchWebAvailableModels(backend *chatgpt_backend.Client) ([]string, error) {
+	paths := []string{
+		"/backend-api/models",
+		"/backend-api/models?history_and_training_disabled=false",
+		"/backend-api/models?history_and_training_disabled=true",
+	}
+	var lastErr error
+	for _, path := range paths {
+		models, err := fetchWebAvailableModelsFromPath(backend, path)
+		if err == nil && len(models) > 0 {
+			return models, nil
+		}
+		if err != nil {
+			lastErr = err
+		}
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, fmt.Errorf("no models found from web response")
+}
+
+func fetchWebAvailableModelsFromPath(backend *chatgpt_backend.Client, path string) ([]string, error) {
+	url := backend.BaseURL + path
+	headers, cookies := backend.Headers(url)
+	headers.Set("accept", "application/json")
+	resp, err := backend.HTTP.Request(tls_client_httpi.GET, url, headers, cookies, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("fetch models failed: status=%d body=%s", resp.StatusCode, string(body))
+	}
+	var payload interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, err
+	}
+	return normalizeModelNames(collectModelSlugs(payload)), nil
+}
+
+func collectModelSlugs(node interface{}) []string {
+	seen := map[string]struct{}{}
+	result := make([]string, 0)
+	var walk func(value interface{})
+	walk = func(value interface{}) {
+		switch typed := value.(type) {
+		case map[string]interface{}:
+			for key, item := range typed {
+				lowerKey := strings.ToLower(strings.TrimSpace(key))
+				if text, ok := item.(string); ok && isModelKey(lowerKey) && looksLikeModelSlug(text) {
+					text = strings.TrimSpace(text)
+					if _, exists := seen[text]; !exists {
+						seen[text] = struct{}{}
+						result = append(result, text)
+					}
+				}
+				walk(item)
+			}
+		case []interface{}:
+			for _, item := range typed {
+				walk(item)
+			}
+		}
+	}
+	walk(node)
+	return result
+}
+
+func isModelKey(key string) bool {
+	return key == "slug" || key == "model_slug" || key == "default_model_slug" || key == "next_model_slug"
+}
+
+func looksLikeModelSlug(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	if strings.ContainsAny(value, " @/") {
+		return false
+	}
+	return true
+}
+
+func modelsFromWebList(models []string) []probedModel {
+	items := make([]probedModel, 0, len(models))
+	for _, model := range normalizeModelNames(models) {
+		items = append(items, probedModel{
+			ID:        model,
+			Object:    "model",
+			OwnedBy:   "chatgpt-web",
+			Available: true,
+		})
+	}
+	return items
+}
+
 func ModelsList(c *gin.Context) {
 	data := selectedModelsPayload(conf.GetApp().SummaryModels())
 	c.JSON(http.StatusOK, gin.H{
@@ -162,10 +261,16 @@ func AdminProbeModels(c *gin.Context) {
 	if jb.AssertError(err) {
 		return
 	}
-	candidates := defaultModelCandidates()
-	results := make([]probedModel, 0, len(candidates))
-	for _, candidate := range candidates {
-		results = append(results, probeModelAvailabilityWithClient(backend, strings.TrimSpace(candidate)))
+	models, err := fetchWebAvailableModels(backend)
+	results := make([]probedModel, 0)
+	if err == nil && len(models) > 0 {
+		results = modelsFromWebList(models)
+	} else {
+		candidates := defaultModelCandidates()
+		results = make([]probedModel, 0, len(candidates))
+		for _, candidate := range candidates {
+			results = append(results, probeModelAvailabilityWithClient(backend, strings.TrimSpace(candidate)))
+		}
 	}
 	sort.Slice(results, func(i, j int) bool {
 		if results[i].Available == results[j].Available {
@@ -179,6 +284,7 @@ func AdminProbeModels(c *gin.Context) {
 		"available":        countAvailableModels(results),
 		"total":            len(results),
 		"available_models": extractAvailableModelIDs(results),
+		"source":           map[bool]string{true: "chatgpt_web_models", false: "fallback_probe"}[err == nil && len(models) > 0],
 	}
 	jb.Successful()
 }
