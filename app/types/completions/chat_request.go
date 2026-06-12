@@ -9,8 +9,9 @@ import (
 )
 
 func BuildChatRequest(apiReq *ApiReq) *chat.Request {
-	messages := make([]chat.Message, 0, len(apiReq.Messages))
-	for _, apiMessage := range apiReq.Messages {
+	sourceMessages := chatRequestMessages(apiReq)
+	messages := make([]chat.Message, 0, len(sourceMessages))
+	for _, apiMessage := range sourceMessages {
 		content := chatContentFromOpenAI(apiMessage.Content)
 		messages = append(messages, chat.Message{
 			Id: uuid.New().String(),
@@ -57,6 +58,65 @@ func BuildChatRequest(apiReq *ApiReq) *chat.Request {
 			ScreenHeight:    1440,
 			ScreenWidth:     2560,
 		},
+	}
+}
+
+func chatRequestMessages(apiReq *ApiReq) []ApiMessage {
+	if !shouldCollapseStatelessHistory(apiReq) {
+		return apiReq.Messages
+	}
+	systemParts := make([]string, 0)
+	transcriptParts := make([]string, 0, len(apiReq.Messages))
+	for _, message := range apiReq.Messages {
+		role := strings.TrimSpace(message.Role)
+		content := strings.TrimSpace(contentToText(message.Content))
+		if content == "" {
+			continue
+		}
+		switch role {
+		case "system", "developer":
+			systemParts = append(systemParts, content)
+		default:
+			transcriptParts = append(transcriptParts, transcriptRoleLabel(role)+":\n"+content)
+		}
+	}
+	collapsed := make([]ApiMessage, 0, 2)
+	if len(systemParts) > 0 {
+		collapsed = append(collapsed, ApiMessage{Role: "system", Content: strings.Join(systemParts, "\n\n")})
+	}
+	if len(transcriptParts) == 0 {
+		return apiReq.Messages
+	}
+	collapsed = append(collapsed, ApiMessage{Role: "user", Content: "Conversation transcript:\n\n" + strings.Join(transcriptParts, "\n\n") + "\n\nRespond to the latest user request directly. Do not repeat prior assistant messages unless the latest user explicitly asks for repetition."})
+	return collapsed
+}
+
+func shouldCollapseStatelessHistory(apiReq *ApiReq) bool {
+	if strings.TrimSpace(apiReq.ConversationId) != "" {
+		return false
+	}
+	assistantCount := 0
+	nonSystemCount := 0
+	for _, message := range apiReq.Messages {
+		role := strings.TrimSpace(message.Role)
+		if role != "system" && role != "developer" {
+			nonSystemCount++
+		}
+		if role == "assistant" {
+			assistantCount++
+		}
+	}
+	return assistantCount > 0 && nonSystemCount > 1
+}
+
+func transcriptRoleLabel(role string) string {
+	switch strings.TrimSpace(role) {
+	case "assistant":
+		return "Assistant"
+	case "tool", "function":
+		return "Tool"
+	default:
+		return "User"
 	}
 }
 
