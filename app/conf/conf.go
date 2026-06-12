@@ -337,6 +337,10 @@ func newAuthToken() (string, error) {
 	return "sk-" + hex.EncodeToString(b[:]), nil
 }
 
+func NewAuthToken() (string, error) {
+	return newAuthToken()
+}
+
 func saveAuthTokens(path string, tokens []string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {

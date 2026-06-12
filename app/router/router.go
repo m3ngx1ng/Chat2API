@@ -106,6 +106,7 @@ func NewEngine() *gin.Engine {
 	adminRouter.Use(middleware.AdminAuth)
 	adminRouter.POST("/logout", service.AdminLogout)
 	adminRouter.GET("/session", service.AdminSession)
+	adminRouter.POST("/auth-token/generate", service.AdminGenerateAuthToken)
 	adminRouter.GET("/config", service.AdminGetConfig)
 	adminRouter.PUT("/config", service.AdminSaveConfig)
 	adminRouter.GET("/config/export", service.AdminExportConfig)
