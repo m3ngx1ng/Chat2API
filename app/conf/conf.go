@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -389,6 +390,7 @@ func Init(ctx context.Context) func(context.Context) {
 		if err := ensureAuthTokens(path, &next); err != nil {
 			return err
 		}
+		applyRuntimeOverrides(&next)
 		normalizeConfig(&next)
 		if err := logx.Configure(next.LogLevel, next.LogPath, next.LogFile); err != nil {
 			return err
@@ -426,6 +428,7 @@ func InitServerless(ctx context.Context) func(context.Context) {
 		}
 	}
 	applyEnvOverrides(&next)
+	applyRuntimeOverrides(&next)
 	next.Auth.AccessTokens = nonEmptyAuthTokens(next.Auth.AccessTokens)
 	normalizeConfig(&next)
 	if err := logx.Configure(next.LogLevel, next.LogPath, ""); err != nil {
@@ -464,6 +467,24 @@ func applyEnvOverrides(cfg *app) {
 	}
 	if value := strings.TrimSpace(os.Getenv("LOG_LEVEL")); value != "" {
 		cfg.LogLevel = value
+	}
+}
+
+func applyRuntimeOverrides(cfg *app) {
+	if value := strings.TrimSpace(os.Getenv("BIND")); value != "" {
+		cfg.Bind = value
+	}
+	if value := strings.TrimSpace(os.Getenv("HOST")); value != "" {
+		cfg.Bind = value
+	}
+	if value := strings.TrimSpace(os.Getenv("PORT")); value != "" {
+		port, err := strconv.ParseUint(value, 10, 16)
+		if err == nil && port > 0 {
+			cfg.Port = uint16(port)
+			if cfg.Bind == "" || cfg.Bind == "127.0.0.1" || strings.EqualFold(cfg.Bind, "localhost") {
+				cfg.Bind = "0.0.0.0"
+			}
+		}
 	}
 }
 
