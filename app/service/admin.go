@@ -220,6 +220,7 @@ const adminPageHTML = `<!DOCTYPE html>
     .stat-card .stat-label{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;color:var(--text-tertiary);margin-bottom:6px}
     .stat-card .stat-value{font-size:28px;font-weight:700;letter-spacing:-0.03em;color:var(--text-primary);line-height:1}
     .stat-card .stat-desc{font-size:12px;color:var(--text-tertiary);margin-top:4px}
+    html{scroll-behavior:smooth}
     /* Login Card */
     .login-page{min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--bg);padding:24px}
     .login-box{width:380px;max-width:100%}
@@ -261,12 +262,15 @@ const adminPageHTML = `<!DOCTYPE html>
     .badge.ok{background:var(--success-bg);color:var(--success);border-color:rgba(5,150,105,0.12)}
     .badge.warn{background:var(--warning-bg);color:var(--warning);border-color:rgba(180,83,9,0.12)}
     .badge.danger{background:var(--danger-bg);color:var(--danger);border-color:rgba(220,38,38,0.12)}
-    /* Row list */
-    .row-list{display:grid;gap:8px}
-    .row-item{display:flex;align-items:center;gap:10px;padding:10px 14px;background:var(--bg);border:1px solid var(--border-light);border-radius:var(--radius);transition:border-color 0.12s ease}
-    .row-item:hover{border-color:var(--border)}
-    .row-item input[type="text"]{flex:1;background:transparent;border:none;color:var(--text-primary);font-family:var(--mono);font-size:13px;outline:none;padding:2px 0}
-    .row-item input::placeholder{color:var(--text-placeholder)}
+    /* Row list — 更精致的 key 输入行 */
+    .row-list{display:grid;gap:6px}
+    .row-item{display:flex;align-items:center;gap:8px;padding:0;background:transparent;border:none;border-radius:0;transition:none}
+    .row-item:hover{border-color:transparent}
+    .row-item .key-field{flex:1;display:flex;align-items:center;gap:8px;padding:8px 12px;background:var(--bg-input);border:1px solid var(--border-light);border-radius:var(--radius);transition:border-color 0.12s ease,box-shadow 0.12s ease}
+    .row-item .key-field:focus-within{border-color:var(--border-focus);box-shadow:0 0 0 3px rgba(59,130,246,0.12)}
+    .row-item .key-field input{flex:1;background:transparent;border:none;color:var(--text-primary);font-family:var(--mono);font-size:13px;outline:none;padding:0}
+    .row-item .key-field input::placeholder{color:var(--text-placeholder)}
+    .row-item .key-field .key-icon{flex-shrink:0;color:var(--text-tertiary);display:flex;align-items:center}
     /* Account card */
     .account-card{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius-card);overflow:hidden;box-shadow:var(--shadow)}
     .account-card:hover{box-shadow:var(--shadow-elevated)}
@@ -638,10 +642,15 @@ function ensureEmpty() {
   if (!accountList.children.length) accountList.appendChild(empty('当前没有上游账户。'));
 }
 
-// ====== Simple row ======
+// ====== Simple row (key/prefix) ======
 function simpleRow(v, p) {
   const w = document.createElement('div');
   w.className = 'row-item';
+  const kf = document.createElement('div');
+  kf.className = 'key-field';
+  const ik = document.createElement('span');
+  ik.className = 'key-icon';
+  ik.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>';
   const i = document.createElement('input');
   i.value = v || ''; i.placeholder = p; i.spellcheck = false;
   const b = document.createElement('button');
@@ -649,7 +658,8 @@ function simpleRow(v, p) {
   b.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
   b.title = '删除';
   b.onclick = () => { w.remove(); refresh(); ensureEmpty(); };
-  w.append(i, b);
+  kf.append(ik, i);
+  w.append(kf, b);
   return w;
 }
 function addAuth(v) { normalize(); authTokenList.appendChild(simpleRow(v, 'sk-your-local-key')); refresh(); }
@@ -907,6 +917,45 @@ function importBulk() {
   raw.split(/\n+/).forEach(line => { const parts = line.trim().split(',').map(x=>x.trim()); if(parts[0]) addAccount({access_token:parts[0], proxy:parts[1]||'', email:parts[2]||'', type:parts[3]||'', enabled:true, priority:0}); });
   bulkTokens.value = ''; toast('批量 Token 已加入待保存列表','ok');
 }
+
+// ====== Navigation: sidebar smooth scroll ======
+function scrollToSection(id) {
+  const el = document.getElementById(id);
+  if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+// Highlight active nav item
+const navItems = ['navDashboard','navAccounts','navKeys','navSettings'];
+function setActiveNav(activeId) {
+  navItems.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.classList.toggle('active', id === activeId);
+  });
+}
+// Observe sections for scroll-based nav highlight
+const navSectionMap = {
+  navDashboard: 'dashboardScreen',
+  navAccounts: 'accountList',
+  navKeys: 'authTokenList',
+  navSettings: 'globalProxy'
+};
+// IntersectionObserver for active nav
+if (typeof IntersectionObserver !== 'undefined') {
+  const sectionEls = Object.values(navSectionMap).map(id => document.getElementById(id)).filter(Boolean);
+  const navObs = new IntersectionObserver(entries => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        for (const [navId, secId] of Object.entries(navSectionMap)) {
+          if (secId === entry.target.id) { setActiveNav(navId); break; }
+        }
+      }
+    });
+  }, { rootMargin: '-80px 0px -60% 0px' });
+  sectionEls.forEach(el => navObs.observe(el));
+}
+$('navDashboard').onclick = () => { scrollToSection('dashboardScreen'); setActiveNav('navDashboard'); };
+$('navAccounts').onclick = () => { scrollToSection('accountList'); setActiveNav('navAccounts'); };
+$('navKeys').onclick = () => { scrollToSection('authTokenList'); setActiveNav('navKeys'); };
+$('navSettings').onclick = () => { scrollToSection('globalProxy'); setActiveNav('navSettings'); };
 
 // ====== Events ======
 accountRoutingMode.onchange = () => updateSelectedAccountOptions();

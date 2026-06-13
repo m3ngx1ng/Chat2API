@@ -43,38 +43,7 @@ func runCodexImageResponses(c *gin.Context, apiReq *responses.ApiReq) error {
 	}
 	images := extractResponsesImages(currentInput)
 	tool := normalizeCodexImageTool(firstResponsesImageGenerationTool(apiReq.Tools), len(images) > 0)
-	payload := codexResponsesPayload{
-		Model:             codexResponsesModel,
-		Instructions:      codexResponsesInstructions,
-		Store:             false,
-		Input:             codexImageInput(prompt, images),
-		Tools:             []responses.Tool{tool},
-		ToolChoice:        map[string]string{"type": "image_generation"},
-		Stream:            true,
-		ParallelToolCalls: false,
-	}
-	resp, accessToken, err := sendCodexResponsesRequest(c, payload)
-	if err != nil {
-		return runConversationImageResponses(c, apiReq, prompt, images, tool)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-			return runConversationImageResponses(c, apiReq, prompt, images, tool)
-		}
-		if handleResponseError(c, resp, accessToken) {
-			return nil
-		}
-	}
-	if apiReq.Stream {
-		return streamCodexResponses(c, resp)
-	}
-	completed, err := collectCodexResponse(resp.Body)
-	if err != nil {
-		return runConversationImageResponses(c, apiReq, prompt, images, tool)
-	}
-	c.JSON(http.StatusOK, completed)
-	return nil
+	return runConversationImageResponses(c, apiReq, prompt, images, tool)
 }
 
 func runConversationImageResponses(c *gin.Context, apiReq *responses.ApiReq, prompt string, images []string, tool responses.Tool) error {
@@ -157,6 +126,40 @@ func sendCodexResponsesRequest(c *gin.Context, payload codexResponsesPayload) (*
 		return nil, "", err
 	}
 	return result.Response, result.Token, nil
+}
+
+func completedHasImage(completed map[string]interface{}) bool {
+	if completed == nil {
+		return false
+	}
+	b64, _ := imageResultFromCompleted(completed)
+	return b64 != ""
+}
+
+func streamCompletedImageResponse(c *gin.Context, apiReq *responses.ApiReq, completed map[string]interface{}, prompt string) error {
+	output := responsesOutputFromCompleted(completed, prompt)
+	responseID := responses.ResponseID()
+	created := time.Now().Unix()
+	model := responses.NormalizeModel(apiReq.Model)
+	c.Header("Content-Type", "text/event-stream")
+	if _, err := c.Writer.WriteString(responses.SSE(responses.CreatedEvent(responseID, model, created))); err != nil {
+		return err
+	}
+	for index, item := range output {
+		itemCopy := item
+		if _, err := c.Writer.WriteString(responses.SSE(responses.Event{Type: "response.output_item.added", OutputIndex: index, Item: &itemCopy})); err != nil {
+			return err
+		}
+		if _, err := c.Writer.WriteString(responses.SSE(responses.Event{Type: "response.output_item.done", OutputIndex: index, Item: &itemCopy})); err != nil {
+			return err
+		}
+	}
+	if _, err := c.Writer.WriteString(responses.SSE(responses.CompletedEvent(responseID, model, created, output))); err != nil {
+		return err
+	}
+	_, _ = c.Writer.WriteString("data: [DONE]\n\n")
+	c.Writer.Flush()
+	return nil
 }
 
 func streamCodexResponses(c *gin.Context, resp *http.Response) error {

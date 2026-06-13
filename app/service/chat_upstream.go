@@ -67,13 +67,17 @@ func prepareFConversation(backend *chatgpt_backend.Client, upstreamURL string, c
 	if backend.AccAuth == "" || !strings.HasSuffix(upstreamURL, "/backend-api/f/conversation") {
 		return "", nil
 	}
+	clientPrepareState := strings.TrimSpace(chatReq.ClientPrepareState)
+	if clientPrepareState == "" {
+		clientPrepareState = "success"
+	}
 	path := "/backend-api/f/conversation/prepare"
 	payload := map[string]interface{}{
 		"action":                 "next",
 		"fork_from_shared_post":  false,
 		"parent_message_id":      chatReq.ParentMessageId,
 		"model":                  chatReq.Model,
-		"client_prepare_state":   "success",
+		"client_prepare_state":   clientPrepareState,
 		"timezone_offset_min":    chatReq.TimeZoneOffsetMin,
 		"timezone":               chatReq.Timezone,
 		"conversation_mode":      chatReq.ConversationMode,

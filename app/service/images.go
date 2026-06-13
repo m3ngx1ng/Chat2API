@@ -207,6 +207,7 @@ func collectAuroraConversationImageResponse(c *gin.Context, prompt string, tool 
 		chatReq := imageConversationRequest(prompt, nil, tool)
 		applyChatTargetDefaults(backend, chatReq)
 		applyFConversationPayloadDefaults(chatReq)
+		chatReq.ClientPrepareState = "none"
 		conduitToken, err := prepareFConversation(backend, backend.BaseURL+"/backend-api/f/conversation", chatReq)
 		if err != nil {
 			return nil, err
@@ -221,7 +222,7 @@ func collectAuroraConversationImageResponse(c *gin.Context, prompt string, tool 
 			"timezone":                 chatReq.Timezone,
 			"conversation_mode":        map[string]string{"kind": "primary_assistant"},
 			"enable_message_followups": true,
-			"system_hints":             []string{"picture_v2"},
+			"system_hints":             []string{},
 			"supports_buffering":       true,
 			"supported_encodings":      []string{"v1"},
 			"client_contextual_info": map[string]interface{}{
@@ -277,7 +278,7 @@ func auroraImageMessages(prompt string) []map[string]interface{} {
 			"developer_mode_connector_ids": []interface{}{},
 			"selected_github_repos":        []interface{}{},
 			"selected_all_github_repos":    false,
-			"system_hints":                 []string{"picture_v2"},
+				"system_hints":                 []string{},
 			"serialization_metadata":       map[string]interface{}{"custom_symbol_offsets": []interface{}{}},
 		},
 	}}
@@ -301,13 +302,13 @@ func imageConversationRequest(prompt string, images []string, tool responses.Too
 		}},
 		ParentMessageId: uuid.New().String(),
 	})
-	req.SystemHints = []string{"picture_v2"}
+	req.SystemHints = []string{}
 	if len(req.Messages) > 0 {
 		req.Messages[0].Metadata = map[string]interface{}{
 			"developer_mode_connector_ids": []interface{}{},
 			"selected_github_repos":        []interface{}{},
 			"selected_all_github_repos":    false,
-			"system_hints":                 []string{"picture_v2"},
+			"system_hints":                 []string{},
 			"serialization_metadata":       map[string]interface{}{"custom_symbol_offsets": []interface{}{}},
 		}
 	}
@@ -405,6 +406,9 @@ func pollConversationImageResult(backend *chatgpt_backend.Client, conversationID
 		if i > 0 {
 			time.Sleep(2 * time.Second)
 		}
+		if err := waitConversationAsyncStatus(backend, conversationID); err != nil {
+			lastErr = err
+		}
 		conversation, err := fetchConversation(backend, conversationID)
 		if err != nil {
 			lastErr = err
@@ -428,6 +432,27 @@ func pollConversationImageResult(backend *chatgpt_backend.Client, conversationID
 		return nil, lastErr
 	}
 	return nil, fmt.Errorf("upstream completed without generating images")
+}
+
+func waitConversationAsyncStatus(backend *chatgpt_backend.Client, conversationID string) error {
+	path := "/backend-api/conversation/" + conversationID + "/async-status"
+	url := backend.BaseURL + path
+	headers, cookies := backend.Headers(url)
+	headers.Set("accept", "application/json")
+	headers.Set("content-type", "application/json")
+	resp, err := backend.HTTP.Request(tls_client_httpi.POST, url, headers, cookies, strings.NewReader(`{"status":null}`))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("async status failed: status=%d body=%s", resp.StatusCode, string(body))
+	}
+	return nil
 }
 
 func fetchConversation(backend *chatgpt_backend.Client, conversationID string) (map[string]interface{}, error) {
@@ -529,12 +554,14 @@ func imageResultFromCompleted(value interface{}) (string, string) {
 	switch v := value.(type) {
 	case map[string]interface{}:
 		result := strings.TrimSpace(responseStringValue(v["result"], ""))
-		if result != "" {
+		if isImageResultValue(result) {
 			return stripImageDataURL(result), responseStringValue(v["revised_prompt"], "")
 		}
 		for _, key := range []string{"b64_json", "image", "url"} {
 			if text := strings.TrimSpace(responseStringValue(v[key], "")); text != "" {
-				return stripImageDataURL(text), responseStringValue(v["revised_prompt"], "")
+				if isImageResultValue(text) || key == "b64_json" {
+					return stripImageDataURL(text), responseStringValue(v["revised_prompt"], "")
+				}
 			}
 		}
 		for _, child := range v {
@@ -553,6 +580,32 @@ func imageResultFromCompleted(value interface{}) (string, string) {
 		}
 	}
 	return "", ""
+}
+
+func isImageResultValue(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	if strings.HasPrefix(value, "data:image/") {
+		return true
+	}
+	if strings.HasPrefix(value, "http://") || strings.HasPrefix(value, "https://") {
+		return strings.Contains(value, "/backend-api/estuary/content") || strings.Contains(value, "image") || strings.Contains(value, ".png") || strings.Contains(value, ".jpg") || strings.Contains(value, ".jpeg") || strings.Contains(value, ".webp")
+	}
+	if strings.HasPrefix(value, "{") || strings.HasPrefix(value, "[") {
+		return false
+	}
+	if len(value) < 256 {
+		return false
+	}
+	for _, ch := range value {
+		if (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '+' || ch == '/' || ch == '=' || ch == '\n' || ch == '\r' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func findImageFileID(value interface{}) string {
