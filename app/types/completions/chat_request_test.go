@@ -80,8 +80,16 @@ func TestBuildChatRequestSanitizesInlineImageDataURLInTextHistory(t *testing.T) 
 	if strings.Contains(text, "data:image/png;base64") {
 		t.Fatalf("expected inline image data url to be sanitized, got %q", text)
 	}
-	if !strings.Contains(text, "[image omitted:") {
+	if !strings.Contains(text, "[image omitted") {
 		t.Fatalf("expected placeholder after sanitization, got %q", text)
+	}
+	userParts := chatReq.Messages[1].Content.Parts
+	if len(userParts) < 2 {
+		t.Fatalf("expected carried image plus user text, got %#v", userParts)
+	}
+	imagePart, ok := userParts[0].(map[string]interface{})
+	if !ok || imagePart["type"] != "input_image" {
+		t.Fatalf("expected carried inline image to become input_image, got %#v", userParts[0])
 	}
 }
 
@@ -110,6 +118,36 @@ func TestBuildChatRequestKeepsStructuredInputImage(t *testing.T) {
 	}
 	if got := imagePart["image_url"]; got != "data:image/png;base64,AAAAABBBBBCCCCCDDDD==" {
 		t.Fatalf("expected structured input image to be preserved, got %#v", got)
+	}
+}
+
+func TestBuildChatRequestCollapsedHistoryCarriesAssistantImageToLatestUser(t *testing.T) {
+	apiReq := &ApiReq{
+		Messages: []ApiMessage{
+			{Role: "user", Content: "先生成图片"},
+			{Role: "assistant", Content: "![image](data:image/png;base64,AAAAABBBBBCCCCCDDDD==)"},
+			{Role: "user", Content: "把刚才那张图改成黑白风格"},
+		},
+		Model: "auto",
+	}
+	chatReq := BuildChatRequest(apiReq)
+	if len(chatReq.Messages) != 1 {
+		t.Fatalf("expected collapsed message, got %d", len(chatReq.Messages))
+	}
+	parts := chatReq.Messages[0].Content.Parts
+	if len(parts) < 2 {
+		t.Fatalf("expected image plus transcript text, got %#v", parts)
+	}
+	imagePart, ok := parts[0].(map[string]interface{})
+	if !ok || imagePart["type"] != "input_image" {
+		t.Fatalf("expected first collapsed part to be carried input_image, got %#v", parts[0])
+	}
+	lastPart, ok := parts[len(parts)-1].(string)
+	if !ok {
+		t.Fatalf("expected transcript text part, got %#v", parts[len(parts)-1])
+	}
+	if !containsAll(lastPart, "User:\n先生成图片", "Assistant:\n[image omitted from transcript and attached as image input]", "User:\n把刚才那张图改成黑白风格") {
+		t.Fatalf("unexpected collapsed transcript: %q", lastPart)
 	}
 }
 

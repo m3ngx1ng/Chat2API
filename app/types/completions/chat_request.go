@@ -10,12 +10,13 @@ import (
 )
 
 var inlineImageDataURLPattern = regexp.MustCompile(`(?is)data:image/[a-z0-9.+-]+;base64,[a-z0-9+/=\r\n]+`)
+var inlineImageMarkdownPattern = regexp.MustCompile(`(?is)!\[[^\]]*\]\(\s*\[image omitted: inline base64 image removed from text and attached as image input\]\s*\)`)
 
 func BuildChatRequest(apiReq *ApiReq) *chat.Request {
 	sourceMessages := chatRequestMessages(apiReq)
 	messages := make([]chat.Message, 0, len(sourceMessages))
 	for _, apiMessage := range sourceMessages {
-		content := chatContentFromOpenAI(sanitizeOpenAIMessageContent(apiMessage.Content))
+		content := chatContentFromOpenAI(apiMessage.Content)
 		messages = append(messages, chat.Message{
 			Id: uuid.New().String(),
 			Author: chat.Author{
@@ -65,30 +66,37 @@ func BuildChatRequest(apiReq *ApiReq) *chat.Request {
 }
 
 func sanitizeOpenAIMessageContent(content interface{}) interface{} {
-	return sanitizeOpenAIMessageContentWithKey("", content)
+	sanitized, _ := sanitizeOpenAIMessageContentWithKey("", content)
+	return sanitized
 }
 
-func sanitizeOpenAIMessageContentWithKey(key string, content interface{}) interface{} {
+func sanitizeOpenAIMessageContentWithKey(key string, content interface{}) (interface{}, []string) {
 	switch v := content.(type) {
 	case string:
 		if shouldKeepImagePayloadKey(key) {
-			return content
+			return content, nil
 		}
 		return sanitizeInlineImageDataURLs(v)
 	case []interface{}:
 		items := make([]interface{}, 0, len(v))
+		images := make([]string, 0)
 		for _, item := range v {
-			items = append(items, sanitizeOpenAIMessageContentWithKey("", item))
+			sanitized, extracted := sanitizeOpenAIMessageContentWithKey("", item)
+			items = append(items, sanitized)
+			images = append(images, extracted...)
 		}
-		return items
+		return items, images
 	case map[string]interface{}:
 		clone := make(map[string]interface{}, len(v))
+		images := make([]string, 0)
 		for key, value := range v {
-			clone[key] = sanitizeOpenAIMessageContentWithKey(key, value)
+			sanitized, extracted := sanitizeOpenAIMessageContentWithKey(key, value)
+			clone[key] = sanitized
+			images = append(images, extracted...)
 		}
-		return clone
+		return clone, images
 	default:
-		return content
+		return content, nil
 	}
 }
 
@@ -101,22 +109,26 @@ func shouldKeepImagePayloadKey(key string) bool {
 	}
 }
 
-func sanitizeInlineImageDataURLs(text string) string {
+func sanitizeInlineImageDataURLs(text string) (string, []string) {
 	if text == "" || !strings.Contains(strings.ToLower(text), "data:image/") {
-		return text
+		return text, nil
 	}
-	return inlineImageDataURLPattern.ReplaceAllString(text, "[image omitted: inline base64 image removed to stay within upstream message size limits]")
+	images := inlineImageDataURLPattern.FindAllString(text, -1)
+	replaced := inlineImageDataURLPattern.ReplaceAllString(text, "[image omitted: inline base64 image removed from text and attached as image input]")
+	replaced = inlineImageMarkdownPattern.ReplaceAllString(replaced, "[image omitted from transcript and attached as image input]")
+	return replaced, images
 }
 
 func chatRequestMessages(apiReq *ApiReq) []ApiMessage {
+	sanitized, carriedImages := sanitizeMessagesAndExtractInlineImages(apiReq.Messages)
 	if !shouldCollapseStatelessHistory(apiReq) {
-		return apiReq.Messages
+		return attachInlineImagesToLatestUser(sanitized, carriedImages)
 	}
 	systemParts := make([]string, 0)
-	transcriptParts := make([]string, 0, len(apiReq.Messages))
-	for _, message := range apiReq.Messages {
+	transcriptParts := make([]string, 0, len(sanitized))
+	for _, message := range sanitized {
 		role := strings.TrimSpace(message.Role)
-		content := strings.TrimSpace(contentToText(message.Content))
+		content := strings.TrimSpace(transcriptTextFromContent(message.Content))
 		if content == "" {
 			continue
 		}
@@ -132,10 +144,98 @@ func chatRequestMessages(apiReq *ApiReq) []ApiMessage {
 		collapsed = append(collapsed, ApiMessage{Role: "system", Content: strings.Join(systemParts, "\n\n")})
 	}
 	if len(transcriptParts) == 0 {
-		return apiReq.Messages
+		return attachInlineImagesToLatestUser(sanitized, carriedImages)
 	}
-	collapsed = append(collapsed, ApiMessage{Role: "user", Content: "Conversation transcript:\n\n" + strings.Join(transcriptParts, "\n\n") + "\n\nRespond to the latest user request directly. Do not repeat prior assistant messages unless the latest user explicitly asks for repetition."})
+	content := interface{}("Conversation transcript:\n\n" + strings.Join(transcriptParts, "\n\n") + "\n\nRespond to the latest user request directly. Do not repeat prior assistant messages unless the latest user explicitly asks for repetition.")
+	if len(carriedImages) > 0 {
+		content = appendInlineImagesToContent(content, carriedImages)
+	}
+	collapsed = append(collapsed, ApiMessage{Role: "user", Content: content})
 	return collapsed
+}
+
+func sanitizeMessagesAndExtractInlineImages(messages []ApiMessage) ([]ApiMessage, []string) {
+	sanitized := make([]ApiMessage, 0, len(messages))
+	images := make([]string, 0)
+	for _, message := range messages {
+		content, extracted := sanitizeOpenAIMessageContentWithKey("", message.Content)
+		message.Content = content
+		sanitized = append(sanitized, message)
+		images = append(images, extracted...)
+	}
+	return sanitized, images
+}
+
+func attachInlineImagesToLatestUser(messages []ApiMessage, images []string) []ApiMessage {
+	if len(images) == 0 {
+		return messages
+	}
+	result := append([]ApiMessage(nil), messages...)
+	for i := len(result) - 1; i >= 0; i-- {
+		if strings.TrimSpace(result[i].Role) != "user" {
+			continue
+		}
+		result[i].Content = appendInlineImagesToContent(result[i].Content, images)
+		return result
+	}
+	return append(result, ApiMessage{Role: "user", Content: appendInlineImagesToContent("", images)})
+}
+
+func appendInlineImagesToContent(content interface{}, images []string) interface{} {
+	if len(images) == 0 {
+		return content
+	}
+	parts := make([]interface{}, 0, len(images)+1)
+	for _, image := range images {
+		parts = append(parts, map[string]interface{}{"type": "input_image", "image_url": image})
+	}
+	if contentHasValue(content) {
+		parts = append(parts, content)
+	}
+	return parts
+}
+
+func contentHasValue(content interface{}) bool {
+	switch v := content.(type) {
+	case nil:
+		return false
+	case string:
+		return strings.TrimSpace(v) != ""
+	default:
+		return true
+	}
+}
+
+func transcriptTextFromContent(content interface{}) string {
+	switch v := content.(type) {
+	case nil:
+		return ""
+	case string:
+		return v
+	case []interface{}:
+		parts := make([]string, 0, len(v))
+		for _, item := range v {
+			if text := transcriptTextFromContent(item); strings.TrimSpace(text) != "" {
+				parts = append(parts, text)
+			}
+		}
+		return strings.Join(parts, "")
+	case map[string]interface{}:
+		partType := strings.TrimSpace(stringValue(v["type"]))
+		contentType := strings.TrimSpace(stringValue(v["content_type"]))
+		if partType == "image_url" || partType == "input_image" || partType == "image" || contentType == "image_asset_pointer" || v["image_url"] != nil {
+			return "[image omitted from transcript and attached as image input]"
+		}
+		if text, ok := v["text"].(string); ok {
+			return text
+		}
+		if text, ok := v["content"].(string); ok {
+			return text
+		}
+		return ""
+	default:
+		return ""
+	}
 }
 
 func shouldCollapseStatelessHistory(apiReq *ApiReq) bool {
