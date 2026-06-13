@@ -3,10 +3,12 @@ package service
 import (
 	"bufio"
 	"bytes"
+	"chat2api/app/chatgpt_backend"
 	"chat2api/app/common"
 	"chat2api/app/token_pool"
 	"chat2api/app/types/chat"
 	"chat2api/app/types/completions"
+	"chat2api/app/types/responses"
 	"chat2api/pkg/logx"
 	"encoding/json"
 	"errors"
@@ -29,6 +31,13 @@ func Completions(c *gin.Context) {
 		common.ErrorResponse(c, http.StatusBadRequest, "Invalid parameter", nil)
 		return
 	}
+	if isChatCompletionsImageRequest(apiReq) {
+		if err := runChatCompletionsImageRequest(c, apiReq); err != nil {
+			logx.WithContext(c.Request.Context()).Error(err.Error())
+			common.ErrorResponse(c, http.StatusBadGateway, "image generation failed", err.Error())
+		}
+		return
+	}
 	if err := prepareFunctionCallingRequest(apiReq); err != nil {
 		common.ErrorResponse(c, http.StatusBadRequest, err.Error(), nil)
 		return
@@ -40,17 +49,19 @@ func Completions(c *gin.Context) {
 		common.ErrorResponse(c, http.StatusBadRequest, errStr, nil)
 		return
 	}
-	response, accessToken, err := sendChatRequest(c, chatReq)
+	upstreamResult, err := sendChatRequestWithBackend(c, chatReq, chatReq.Model)
 	if err != nil {
 		logx.WithContext(c.Request.Context()).Error(err.Error())
 		common.ErrorResponse(c, http.StatusBadGateway, "upstream request failed", err.Error())
 		return
 	}
+	response := upstreamResult.Response
+	accessToken := upstreamResult.Token
 	defer response.Body.Close()
 	if handleResponseError(c, response, accessToken) {
 		return
 	}
-	result, err := handlerResponse(c, apiReq, response)
+	result, err := handlerResponse(c, apiReq, response, upstreamResult.Backend)
 	if err != nil {
 		logx.WithContext(c.Request.Context()).Error(err.Error())
 		common.ErrorResponse(c, http.StatusBadGateway, "", err.Error())
@@ -66,6 +77,146 @@ func Completions(c *gin.Context) {
 		resp.MessageId = result.MessageId
 		c.JSON(http.StatusOK, resp)
 	}
+}
+
+func isChatCompletionsImageRequest(apiReq *completions.ApiReq) bool {
+	model := strings.ToLower(strings.TrimSpace(apiReq.Model))
+	if strings.HasPrefix(model, "gpt-image") || strings.HasPrefix(model, "dall-e") {
+		return true
+	}
+	for _, tool := range apiReq.Tools {
+		if strings.EqualFold(strings.TrimSpace(tool.Type), "image_generation") {
+			return true
+		}
+	}
+	return false
+}
+
+func runChatCompletionsImageRequest(c *gin.Context, apiReq *completions.ApiReq) error {
+	prompt, images := chatCompletionsImagePrompt(apiReq.Messages)
+	if strings.TrimSpace(prompt) == "" {
+		return fmt.Errorf("image generation requires user prompt")
+	}
+	tool := normalizeCodexImageTool(responsesImageToolFromCompletions(apiReq), len(images) > 0)
+	if strings.TrimSpace(tool.Model) == "" {
+		tool.Model = strings.TrimSpace(apiReq.Model)
+	}
+	completed, err := collectConversationImageResponse(c, prompt, images, tool)
+	if err != nil {
+		return err
+	}
+	b64, revised := imageResultFromCompleted(completed)
+	if b64 == "" {
+		return fmt.Errorf("upstream completed without generating images")
+	}
+	return writeChatCompletionsImageResponse(c, apiReq, b64, revised, completed)
+}
+
+func chatCompletionsImagePrompt(messages []completions.ApiMessage) (string, []string) {
+	parts := make([]string, 0)
+	images := make([]string, 0)
+	for _, message := range messages {
+		if strings.TrimSpace(message.Role) != "user" {
+			continue
+		}
+		collectChatCompletionImageContent(message.Content, &parts, &images)
+	}
+	return strings.TrimSpace(strings.Join(parts, "")), images
+}
+
+func collectChatCompletionImageContent(value interface{}, textParts *[]string, images *[]string) {
+	switch v := value.(type) {
+	case string:
+		*textParts = append(*textParts, v)
+	case []interface{}:
+		for _, item := range v {
+			collectChatCompletionImageContent(item, textParts, images)
+		}
+	case map[string]interface{}:
+		partType := strings.TrimSpace(responseStringValue(v["type"], ""))
+		switch partType {
+		case "text", "input_text", "output_text":
+			if text := responseStringValue(v["text"], ""); text != "" {
+				*textParts = append(*textParts, text)
+			}
+		case "image_url", "input_image", "image":
+			if image := chatCompletionImageValue(v); image != "" {
+				*images = append(*images, image)
+			}
+		default:
+			if content, ok := v["content"]; ok {
+				collectChatCompletionImageContent(content, textParts, images)
+			}
+		}
+	}
+}
+
+func chatCompletionImageValue(item map[string]interface{}) string {
+	for _, key := range []string{"image_url", "url", "base64", "b64_json"} {
+		value, ok := item[key]
+		if !ok {
+			continue
+		}
+		if text := responseStringValue(value, ""); text != "" {
+			return strings.TrimSpace(text)
+		}
+		if obj, ok := value.(map[string]interface{}); ok {
+			for _, nested := range []string{"url", "image_url", "base64", "b64_json"} {
+				if text := responseStringValue(obj[nested], ""); text != "" {
+					return strings.TrimSpace(text)
+				}
+			}
+		}
+	}
+	if source, ok := item["source"].(map[string]interface{}); ok && responseStringValue(source["type"], "") == "base64" {
+		return strings.TrimSpace(responseStringValue(source["data"], ""))
+	}
+	return ""
+}
+
+func responsesImageToolFromCompletions(apiReq *completions.ApiReq) responses.Tool {
+	for _, tool := range apiReq.Tools {
+		if strings.EqualFold(strings.TrimSpace(tool.Type), "image_generation") {
+			return responses.Tool{Type: "image_generation", Model: strings.TrimSpace(apiReq.Model)}
+		}
+	}
+	return responses.Tool{Type: "image_generation", Model: strings.TrimSpace(apiReq.Model)}
+}
+
+func writeChatCompletionsImageResponse(c *gin.Context, apiReq *completions.ApiReq, b64 string, revised string, completed map[string]interface{}) error {
+	if strings.TrimSpace(revised) == "" {
+		revised = strings.TrimSpace(chatCompletionsPromptFallback(apiReq.Messages))
+	}
+	content := "![image](data:image/png;base64," + b64 + ")"
+	if apiReq.Stream {
+		id := completions.GenerateCompletionID(29)
+		created := completions.NewApiRespStream(id, apiReq.Model, content)
+		created.Choices[0].Delta.Role = "assistant"
+		if _, err := c.Writer.WriteString("data: " + created.String() + "\n\n"); err != nil {
+			return err
+		}
+		finalLine := completions.StopChunk(id, apiReq.Model, "stop")
+		if _, err := c.Writer.WriteString(fmt.Sprint("data: ", finalLine.String(), "\n\n")); err != nil {
+			return err
+		}
+		if _, err := c.Writer.WriteString("data: [DONE]\n\n"); err != nil {
+			return err
+		}
+		c.Writer.Flush()
+		return nil
+	}
+	id := completions.GenerateCompletionID(29)
+	resp := completions.NewApiRespJson(id, apiReq.Model, content)
+	if conversationID := strings.TrimSpace(responseStringValue(completed["conversation_id"], "")); conversationID != "" {
+		resp.ConversationId = conversationID
+	}
+	c.JSON(http.StatusOK, resp)
+	return nil
+}
+
+func chatCompletionsPromptFallback(messages []completions.ApiMessage) string {
+	prompt, _ := chatCompletionsImagePrompt(messages)
+	return prompt
 }
 
 func prepareFunctionCallingRequest(apiReq *completions.ApiReq) error {
@@ -230,6 +381,8 @@ type chatResult struct {
 	FinishReason   string
 	ToolCalls      []completions.ToolCall
 	ToolContent    string
+	ImageTask      bool
+	ImageFileID    string
 }
 
 type chatStreamEvent struct {
@@ -278,6 +431,15 @@ func handleChatStream(resp *http.Response, onEvent func(chatStreamEvent) error) 
 		if chatResp.Message.Id != "" {
 			result.MessageId = chatResp.Message.Id
 		}
+		if imageTask := chatImageTaskFromRawEvent(rawEvent); imageTask || result.ImageFileID == "" {
+			if imageTask {
+				result.ImageTask = true
+			}
+			if fileID := findImageFileID(rawEvent); fileID != "" {
+				result.ImageTask = true
+				result.ImageFileID = fileID
+			}
+		}
 		if chatResp.Message.Metadata.MessageType != "" &&
 			chatResp.Message.Metadata.MessageType != "next" &&
 			chatResp.Message.Metadata.MessageType != "continue" {
@@ -317,6 +479,62 @@ func handleChatStream(resp *http.Response, onEvent func(chatStreamEvent) error) 
 	}
 	result.Content = previousText.Text
 	return result, nil
+}
+
+func chatImageTaskFromRawEvent(event map[string]interface{}) bool {
+	if len(event) == 0 {
+		return false
+	}
+	if strings.Contains(strings.ToLower(responseStringValue(event["type"], "")), "image") {
+		return true
+	}
+	if chatImageTaskFromServerMetadata(responseMapValue(event["metadata"])) {
+		return true
+	}
+	if chatImageTaskFromMap(responseMapValue(event["message"])) {
+		return true
+	}
+	vMap := responseMapValue(event["v"])
+	if chatImageTaskFromMap(responseMapValue(vMap["message"])) || chatImageTaskFromMap(vMap) {
+		return true
+	}
+	return chatImageTaskFromServerMetadata(responseMapValue(vMap["metadata"]))
+}
+
+func chatImageTaskFromMap(value map[string]interface{}) bool {
+	if len(value) == 0 {
+		return false
+	}
+	metadata := responseMapValue(value["metadata"])
+	if len(metadata) == 0 {
+		return false
+	}
+	if responseStringValue(metadata["image_gen_task_id"], "") != "" {
+		return true
+	}
+	if v, ok := metadata["image_gen_multi_stream"].(bool); ok && v {
+		return true
+	}
+	if v, ok := metadata["ui_card"].(bool); ok && v && strings.Contains(strings.ToLower(responseStringValue(metadata["ui_card_title"], "")), "图") {
+		return true
+	}
+	return false
+}
+
+func chatImageTaskFromServerMetadata(metadata map[string]interface{}) bool {
+	if len(metadata) == 0 {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(responseStringValue(metadata["turn_use_case"], "")), "image gen") {
+		return true
+	}
+	if invoked, ok := metadata["tool_invoked"].(bool); ok && invoked {
+		toolName := strings.TrimSpace(responseStringValue(metadata["tool_name"], ""))
+		if strings.Contains(strings.ToLower(toolName), "image") {
+			return true
+		}
+	}
+	return false
 }
 
 func chatResponseText(chatResp chat.Response) string {
@@ -485,7 +703,7 @@ func responseMapValue(value interface{}) map[string]interface{} {
 	return nil
 }
 
-func handlerResponse(c *gin.Context, apiReq *completions.ApiReq, resp *http.Response) (*chatResult, error) {
+func handlerResponse(c *gin.Context, apiReq *completions.ApiReq, resp *http.Response, backend *chatgpt_backend.Client) (*chatResult, error) {
 	if apiReq.Stream {
 		c.Header("Content-Type", "text/event-stream")
 	} else {
@@ -496,6 +714,9 @@ func handlerResponse(c *gin.Context, apiReq *completions.ApiReq, resp *http.Resp
 	detector := completions.NewStreamToolDetector(completions.ToolifyTriggerSignal)
 	result, err := handleChatStream(resp, func(event chatStreamEvent) error {
 		if !apiReq.Stream {
+			return nil
+		}
+		if event.Result != nil && event.Result.ImageTask {
 			return nil
 		}
 		if hasTools {
@@ -531,6 +752,35 @@ func handlerResponse(c *gin.Context, apiReq *completions.ApiReq, resp *http.Resp
 	if !hasTools && apiReq.HasToolResults {
 		result.Content = completions.StripFunctionCallXML(result.Content)
 	}
+	if result.ImageTask && result.ConversationId != "" && backend != nil {
+		completed, err := chatCompletionImageCompletedFromResult(backend, result)
+		if err != nil {
+			return nil, err
+		}
+		if b64, _ := imageResultFromCompleted(completed); b64 != "" {
+			result.Content = "![image](data:image/png;base64," + b64 + ")"
+			result.FinishReason = "stop"
+			if apiReq.Stream {
+				id := completions.GenerateCompletionID(29)
+				chunk := completions.NewApiRespStream(id, apiReq.Model, result.Content)
+				chunk.ConversationId = result.ConversationId
+				chunk.MessageId = result.MessageId
+				chunk.Choices[0].Delta.Role = "assistant"
+				if _, err := c.Writer.WriteString("data: " + chunk.String() + "\n\n"); err != nil {
+					return nil, err
+				}
+				finalLine := completions.StopChunk(id, apiReq.Model, "stop")
+				if _, err := c.Writer.WriteString(fmt.Sprint("data: ", finalLine.String(), "\n\n")); err != nil {
+					return nil, err
+				}
+				if _, err := c.Writer.WriteString("data: [DONE]\n\n"); err != nil {
+					return nil, err
+				}
+				c.Writer.Flush()
+			}
+			return result, nil
+		}
+	}
 	if apiReq.Stream && hasTools {
 		if err == errToolCallsStreamFinished {
 			return result, nil
@@ -565,6 +815,15 @@ func handlerResponse(c *gin.Context, apiReq *completions.ApiReq, resp *http.Resp
 		_, _ = c.Writer.WriteString("data: [DONE]\n\n")
 	}
 	return result, nil
+}
+
+func chatCompletionImageCompletedFromResult(backend *chatgpt_backend.Client, result *chatResult) (map[string]interface{}, error) {
+	if result.ImageFileID != "" {
+		if b64, revised, err := downloadConversationImageFile(backend, result.ConversationId, result.ImageFileID); err == nil && b64 != "" {
+			return conversationImageCompleted(b64, revised), nil
+		}
+	}
+	return pollConversationImageResult(backend, result.ConversationId)
 }
 
 func streamFunctionCallingDelta(c *gin.Context, id string, apiReq *completions.ApiReq, detector *completions.StreamToolDetector, event chatStreamEvent) error {

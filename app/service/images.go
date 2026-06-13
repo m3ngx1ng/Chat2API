@@ -402,11 +402,27 @@ func pollConversationImageResult(backend *chatgpt_backend.Client, conversationID
 		if i > 0 {
 			time.Sleep(2 * time.Second)
 		}
-		if err := fetchConversationStreamStatus(backend, conversationID); err != nil {
+		if status, err := fetchConversationStreamStatus(backend, conversationID); err != nil {
 			lastErr = err
+		} else if b64, revised := imageResultFromCompleted(status); b64 != "" {
+			return conversationImageCompleted(b64, revised), nil
+		} else if fileID := strings.TrimSpace(findImageFileID(status)); fileID != "" {
+			if b64, revised, err := downloadConversationImageFile(backend, conversationID, fileID); err == nil && b64 != "" {
+				return conversationImageCompleted(b64, revised), nil
+			} else if err != nil {
+				lastErr = err
+			}
 		}
-		if err := waitConversationAsyncStatus(backend, conversationID); err != nil {
+		if status, err := waitConversationAsyncStatus(backend, conversationID); err != nil {
 			lastErr = err
+		} else if b64, revised := imageResultFromCompleted(status); b64 != "" {
+			return conversationImageCompleted(b64, revised), nil
+		} else if fileID := strings.TrimSpace(findImageFileID(status)); fileID != "" {
+			if b64, revised, err := downloadConversationImageFile(backend, conversationID, fileID); err == nil && b64 != "" {
+				return conversationImageCompleted(b64, revised), nil
+			} else if err != nil {
+				lastErr = err
+			}
 		}
 		conversation, err := fetchConversation(backend, conversationID)
 		if err != nil {
@@ -433,27 +449,27 @@ func pollConversationImageResult(backend *chatgpt_backend.Client, conversationID
 	return nil, fmt.Errorf("upstream completed without generating images")
 }
 
-func fetchConversationStreamStatus(backend *chatgpt_backend.Client, conversationID string) error {
+func fetchConversationStreamStatus(backend *chatgpt_backend.Client, conversationID string) (map[string]interface{}, error) {
 	path := "/backend-api/conversation/" + conversationID + "/stream_status"
 	url := backend.BaseURL + path
 	headers, cookies := backend.Headers(url)
 	headers.Set("accept", "application/json")
 	resp, err := backend.HTTP.Request(tls_client_httpi.GET, url, headers, cookies, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("stream status failed: status=%d body=%s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("stream status failed: status=%d body=%s", resp.StatusCode, string(body))
 	}
-	return nil
+	return jsonObjectOrEmpty(body), nil
 }
 
-func waitConversationAsyncStatus(backend *chatgpt_backend.Client, conversationID string) error {
+func waitConversationAsyncStatus(backend *chatgpt_backend.Client, conversationID string) (map[string]interface{}, error) {
 	path := "/backend-api/conversation/" + conversationID + "/async-status"
 	url := backend.BaseURL + path
 	headers, cookies := backend.Headers(url)
@@ -461,17 +477,25 @@ func waitConversationAsyncStatus(backend *chatgpt_backend.Client, conversationID
 	headers.Set("content-type", "application/json")
 	resp, err := backend.HTTP.Request(tls_client_httpi.POST, url, headers, cookies, strings.NewReader(`{"status":null}`))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("async status failed: status=%d body=%s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("async status failed: status=%d body=%s", resp.StatusCode, string(body))
 	}
-	return nil
+	return jsonObjectOrEmpty(body), nil
+}
+
+func jsonObjectOrEmpty(body []byte) map[string]interface{} {
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return map[string]interface{}{}
+	}
+	return result
 }
 
 func fetchConversation(backend *chatgpt_backend.Client, conversationID string) (map[string]interface{}, error) {
@@ -630,6 +654,11 @@ func isImageResultValue(value string) bool {
 func findImageFileID(value interface{}) string {
 	switch v := value.(type) {
 	case map[string]interface{}:
+		for _, key := range []string{"asset_pointer", "watermarked_asset_pointer", "image_asset_pointer"} {
+			if fileID := fileIDFromPointer(responseStringValue(v[key], "")); fileID != "" {
+				return fileID
+			}
+		}
 		for _, key := range []string{"file_id", "fileId"} {
 			if fileID := strings.TrimSpace(responseStringValue(v[key], "")); strings.HasPrefix(fileID, "file_") {
 				return fileID
@@ -637,11 +666,6 @@ func findImageFileID(value interface{}) string {
 		}
 		for _, key := range []string{"download_url", "url", "image_url"} {
 			if fileID := fileIDFromURL(responseStringValue(v[key], "")); fileID != "" {
-				return fileID
-			}
-		}
-		if pointer := strings.TrimSpace(responseStringValue(v["asset_pointer"], "")); pointer != "" {
-			if fileID := fileIDFromPointer(pointer); fileID != "" {
 				return fileID
 			}
 		}
@@ -656,6 +680,11 @@ func findImageFileID(value interface{}) string {
 				return fileID
 			}
 		}
+	case string:
+		if fileID := fileIDFromPointer(v); fileID != "" {
+			return fileID
+		}
+		return fileIDFromURL(v)
 	}
 	return ""
 }
@@ -664,9 +693,6 @@ func fileIDFromURL(value string) string {
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return ""
-	}
-	if strings.HasPrefix(value, "file_") {
-		return value
 	}
 	if idx := strings.Index(value, "file_"); idx >= 0 {
 		end := idx
@@ -687,8 +713,11 @@ func fileIDFromPointer(pointer string) string {
 	pointer = strings.TrimSpace(pointer)
 	for _, prefix := range []string{"file-service://", "sediment://"} {
 		if strings.HasPrefix(pointer, prefix) {
-			return strings.TrimSpace(strings.TrimPrefix(pointer, prefix))
+			return fileIDFromURL(strings.TrimSpace(strings.TrimPrefix(pointer, prefix)))
 		}
+	}
+	if strings.HasPrefix(pointer, "file_") {
+		return fileIDFromURL(pointer)
 	}
 	return ""
 }

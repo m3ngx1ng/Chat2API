@@ -486,7 +486,7 @@ const adminPageHTML = `<!DOCTYPE html>
           <div class="card">
             <div class="card-body">
               <div class="card-header">
-                <div><h3>上游账户池</h3><p>逐条增删改。access_token 为必填。获取：登录 chatgpt.com → /api/auth/session → 复制 accessToken。</p></div>
+                <div><h3>上游账户池</h3><p>逐条增删改。access_token 为必填。获取：登录 chatgpt.com → /api/auth/session → 复制 accessToken，或直接导入该 JSON。</p></div>
                 <div class="card-actions">
                   <button class="btn btn-secondary btn-sm" id="importBtn">批量导入</button>
                   <button class="btn btn-secondary btn-sm" id="addAccountBtn">新增账户</button>
@@ -499,7 +499,7 @@ const adminPageHTML = `<!DOCTYPE html>
               </div>
               <div class="collapse-content" id="bulkCollapse">
                 <div class="field" style="margin-top:8px;margin-bottom:14px">
-                  <textarea id="bulkTokens" placeholder="每行一个 token，也支持 token,proxy,email,type 四列逗号格式"></textarea>
+                  <textarea id="bulkTokens" placeholder="每行一个 token，也支持 token,proxy,email,type；还可以直接粘贴 /api/auth/session 的完整 JSON"></textarea>
                 </div>
               </div>
               <div class="row-list account-list" id="accountList"></div>
@@ -518,9 +518,9 @@ const adminPageHTML = `<!DOCTYPE html>
           </button>
           <label class="btn btn-secondary" for="importFile">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-            导入配置
+            导入配置 / auth.txt
           </label>
-          <input id="importFile" type="file" accept=".yaml,.yml" class="hidden">
+          <input id="importFile" type="file" accept=".yaml,.yml,.json,.txt" class="hidden">
         </div>
       </div>
     </div>
@@ -813,6 +813,55 @@ function accountCard(a) {
   return c;
 }
 function addAccount(a) { normalize(); accountList.appendChild(accountCard(a)); refresh(); updateSelectedAccountOptions(); refreshSummaryModels(); }
+function sessionAccountFromJSON(raw) {
+  const s = typeof raw === 'string' ? JSON.parse(raw) : raw;
+  const accessToken = String(s.accessToken||'').replace(/^Bearer\s+/i,'').trim();
+  if(!accessToken) throw new Error('未找到 accessToken');
+  const accountId = String((s.account&&s.account.id)||'').trim();
+  const userId = String((s.user&&s.user.id)||'').trim();
+  const iat = Number(s.user&&s.user.iat);
+  return {
+    id: accountId || userId,
+    enabled: true,
+    priority: 0,
+    access_token: accessToken,
+    email: String((s.user&&s.user.email)||'').trim(),
+    type: String((s.account&&s.account.planType)||s.authProvider||'chatgpt-web').trim(),
+    account_id: accountId,
+    expired: String(s.expires||'').trim(),
+    last_refresh: Number.isFinite(iat) && iat > 0 ? new Date(iat*1000).toISOString() : new Date().toISOString(),
+    available_models: [],
+    selected_models: []
+  };
+}
+function sameAccount(a, b) {
+  const av = String(a.account_id||'').trim(), bv = String(b.account_id||'').trim();
+  if(av && bv && av === bv) return true;
+  const ai = String(a.id||'').trim(), bi = String(b.id||'').trim();
+  if(ai && bi && ai === bi) return true;
+  const ae = String(a.email||'').trim().toLowerCase(), be = String(b.email||'').trim().toLowerCase();
+  if(ae && be && ae === be) return true;
+  const at = String(a.access_token||'').trim(), bt = String(b.access_token||'').trim();
+  return !!(at && bt && at === bt);
+}
+function mergeImportedAccount(existing, incoming) {
+  const out = Object.assign({}, existing);
+  ['id','access_token','proxy','email','type','account_id','expired','last_refresh'].forEach(k => { if(String(incoming[k]||'').trim()) out[k] = incoming[k]; });
+  if (out.enabled == null) out.enabled = incoming.enabled !== false;
+  return out;
+}
+function addOrUpdateAccount(a) {
+  normalize();
+  for (const card of Array.from(accountList.children).filter(i=>!i.classList.contains('empty'))) {
+    const current = readAccountCard(card);
+    if (!sameAccount(current, a)) continue;
+    card.replaceWith(accountCard(mergeImportedAccount(current, a)));
+    refresh(); updateSelectedAccountOptions(); refreshSummaryModels();
+    return 'updated';
+  }
+  addAccount(a);
+  return 'added';
+}
 
 // ====== Data helpers ======
 function listValues(n) { return Array.from(n.children).filter(i=>!i.classList.contains('empty')).map(i=>i.querySelector('input')).filter(Boolean).map(i=>i.value.trim()).filter(Boolean); }
@@ -914,8 +963,16 @@ async function importConfig(file) {
 function importBulk() {
   const raw = bulkTokens.value.trim();
   if(!raw) { toast('批量导入内容为空','warn'); return; }
-  raw.split(/\n+/).forEach(line => { const parts = line.trim().split(',').map(x=>x.trim()); if(parts[0]) addAccount({access_token:parts[0], proxy:parts[1]||'', email:parts[2]||'', type:parts[3]||'', enabled:true, priority:0}); });
-  bulkTokens.value = ''; toast('批量 Token 已加入待保存列表','ok');
+  if(raw.startsWith('{')) {
+    try {
+      const action = addOrUpdateAccount(sessionAccountFromJSON(raw));
+      bulkTokens.value = ''; toast(action === 'updated' ? '已从 session JSON 更新账户，记得保存' : '已从 session JSON 填入账户，记得保存','ok');
+    } catch(e) { toast('session JSON 解析失败: '+e.message,'danger'); }
+    return;
+  }
+  let count = 0;
+  raw.split(/\n+/).forEach(line => { const parts = line.trim().split(',').map(x=>x.trim()); if(parts[0]) { addOrUpdateAccount({access_token:parts[0], proxy:parts[1]||'', email:parts[2]||'', type:parts[3]||'', enabled:true, priority:0}); count++; } });
+  bulkTokens.value = ''; toast('已加入/更新 '+String(count)+' 个账户，记得保存','ok');
 }
 
 // ====== Navigation: sidebar smooth scroll ======
