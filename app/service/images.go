@@ -207,7 +207,8 @@ func collectAuroraConversationImageResponse(c *gin.Context, prompt string, tool 
 		chatReq := imageConversationRequest(prompt, nil, tool)
 		applyChatTargetDefaults(backend, chatReq)
 		applyFConversationPayloadDefaults(chatReq)
-		chatReq.ClientPrepareState = "none"
+		chatReq.ClientPrepareState = "success"
+		chatReq.ThinkingEffort = ""
 		conduitToken, err := prepareFConversation(backend, backend.BaseURL+"/backend-api/f/conversation", chatReq)
 		if err != nil {
 			return nil, err
@@ -215,7 +216,7 @@ func collectAuroraConversationImageResponse(c *gin.Context, prompt string, tool 
 		payload := map[string]interface{}{
 			"action":                   "next",
 			"messages":                 auroraImageMessages(prompt),
-			"parent_message_id":        uuid.New().String(),
+			"parent_message_id":        "client-created-root",
 			"model":                    imageChatModel(tool.Model),
 			"client_prepare_state":     "sent",
 			"timezone_offset_min":      chatReq.TimeZoneOffsetMin,
@@ -227,17 +228,16 @@ func collectAuroraConversationImageResponse(c *gin.Context, prompt string, tool 
 			"supported_encodings":      []string{"v1"},
 			"client_contextual_info": map[string]interface{}{
 				"is_dark_mode":      false,
-				"time_since_loaded": 1200,
-				"page_height":       1072,
-				"page_width":        1724,
-				"pixel_ratio":       1.2,
-				"screen_height":     1440,
-				"screen_width":      2560,
+				"time_since_loaded": 54,
+				"page_height":       322,
+				"page_width":        1528,
+				"pixel_ratio":       1.25,
+				"screen_height":     864,
+				"screen_width":      1536,
 				"app_name":          "chatgpt.com",
 			},
 			"paragen_cot_summary_display_override": "allow",
 			"force_parallel_switch":                "auto",
-			"thinking_effort":                      "standard",
 		}
 		body, err := json.Marshal(payload)
 		if err != nil {
@@ -272,14 +272,12 @@ func auroraImageMessages(prompt string) []map[string]interface{} {
 	return []map[string]interface{}{{
 		"id":          uuid.New().String(),
 		"author":      map[string]string{"role": "user"},
-		"create_time": time.Now().Unix(),
+		"create_time": float64(time.Now().UnixMilli()) / 1000,
 		"content":     map[string]interface{}{"content_type": "text", "parts": []string{prompt}},
 		"metadata": map[string]interface{}{
-			"developer_mode_connector_ids": []interface{}{},
-			"selected_github_repos":        []interface{}{},
-			"selected_all_github_repos":    false,
-				"system_hints":                 []string{},
-			"serialization_metadata":       map[string]interface{}{"custom_symbol_offsets": []interface{}{}},
+			"selected_github_repos":     []interface{}{},
+			"selected_all_github_repos": false,
+			"serialization_metadata":    map[string]interface{}{"custom_symbol_offsets": []interface{}{}},
 		},
 	}}
 }
@@ -300,16 +298,14 @@ func imageConversationRequest(prompt string, images []string, tool responses.Too
 			Role:    "user",
 			Content: content,
 		}},
-		ParentMessageId: uuid.New().String(),
+		ParentMessageId: "client-created-root",
 	})
 	req.SystemHints = []string{}
 	if len(req.Messages) > 0 {
 		req.Messages[0].Metadata = map[string]interface{}{
-			"developer_mode_connector_ids": []interface{}{},
-			"selected_github_repos":        []interface{}{},
-			"selected_all_github_repos":    false,
-			"system_hints":                 []string{},
-			"serialization_metadata":       map[string]interface{}{"custom_symbol_offsets": []interface{}{}},
+			"selected_github_repos":     []interface{}{},
+			"selected_all_github_repos": false,
+			"serialization_metadata":    map[string]interface{}{"custom_symbol_offsets": []interface{}{}},
 		}
 	}
 	return req
@@ -406,6 +402,9 @@ func pollConversationImageResult(backend *chatgpt_backend.Client, conversationID
 		if i > 0 {
 			time.Sleep(2 * time.Second)
 		}
+		if err := fetchConversationStreamStatus(backend, conversationID); err != nil {
+			lastErr = err
+		}
 		if err := waitConversationAsyncStatus(backend, conversationID); err != nil {
 			lastErr = err
 		}
@@ -432,6 +431,26 @@ func pollConversationImageResult(backend *chatgpt_backend.Client, conversationID
 		return nil, lastErr
 	}
 	return nil, fmt.Errorf("upstream completed without generating images")
+}
+
+func fetchConversationStreamStatus(backend *chatgpt_backend.Client, conversationID string) error {
+	path := "/backend-api/conversation/" + conversationID + "/stream_status"
+	url := backend.BaseURL + path
+	headers, cookies := backend.Headers(url)
+	headers.Set("accept", "application/json")
+	resp, err := backend.HTTP.Request(tls_client_httpi.GET, url, headers, cookies, nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("stream status failed: status=%d body=%s", resp.StatusCode, string(body))
+	}
+	return nil
 }
 
 func waitConversationAsyncStatus(backend *chatgpt_backend.Client, conversationID string) error {
@@ -616,6 +635,11 @@ func findImageFileID(value interface{}) string {
 				return fileID
 			}
 		}
+		for _, key := range []string{"download_url", "url", "image_url"} {
+			if fileID := fileIDFromURL(responseStringValue(v[key], "")); fileID != "" {
+				return fileID
+			}
+		}
 		if pointer := strings.TrimSpace(responseStringValue(v["asset_pointer"], "")); pointer != "" {
 			if fileID := fileIDFromPointer(pointer); fileID != "" {
 				return fileID
@@ -632,6 +656,29 @@ func findImageFileID(value interface{}) string {
 				return fileID
 			}
 		}
+	}
+	return ""
+}
+
+func fileIDFromURL(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if strings.HasPrefix(value, "file_") {
+		return value
+	}
+	if idx := strings.Index(value, "file_"); idx >= 0 {
+		end := idx
+		for end < len(value) {
+			ch := value[end]
+			if (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '-' {
+				end++
+				continue
+			}
+			break
+		}
+		return value[idx:end]
 	}
 	return ""
 }

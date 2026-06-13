@@ -34,3 +34,10 @@ func TestFileIDFromPointer(t *testing.T) {
 		t.Fatalf("expected empty file id, got %q", got)
 	}
 }
+
+func TestFileIDFromURL(t *testing.T) {
+	url := "https://chatgpt.com/backend-api/estuary/content?id=file_000000001a1c7207aab44ceac99cd97c&ts=494822"
+	if got := fileIDFromURL(url); got != "file_000000001a1c7207aab44ceac99cd97c" {
+		t.Fatalf("expected file id from url, got %q", got)
+	}
+}

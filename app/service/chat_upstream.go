@@ -86,7 +86,9 @@ func prepareFConversation(backend *chatgpt_backend.Client, upstreamURL string, c
 		"supports_buffering":     true,
 		"supported_encodings":    []string{"v1"},
 		"client_contextual_info": map[string]interface{}{"app_name": "chatgpt.com"},
-		"thinking_effort":        "standard",
+	}
+	if thinkingEffort := strings.TrimSpace(chatReq.ThinkingEffort); thinkingEffort != "" {
+		payload["thinking_effort"] = thinkingEffort
 	}
 	if mimeTypes := attachmentMimeTypes(chatReq); len(mimeTypes) > 0 {
 		payload["attachment_mime_types"] = mimeTypes
