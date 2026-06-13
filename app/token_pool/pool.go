@@ -2,6 +2,7 @@ package token_pool
 
 import (
 	"chat2api/app/common"
+	"strings"
 	"sync"
 )
 
@@ -17,10 +18,11 @@ type AccessTokenPool struct {
 }
 
 type AccessToken struct {
-	Token     string `yaml:"token,omitempty"`
-	ExpiresAt int64  `yaml:"expires_at,omitempty"`
-	Proxy     string `yaml:"proxy,omitempty"`
-	CanUseAt  int64  `yaml:"-"`
+	Token     string   `yaml:"token,omitempty"`
+	ExpiresAt int64    `yaml:"expires_at,omitempty"`
+	Proxy     string   `yaml:"proxy,omitempty"`
+	CanUseAt  int64    `yaml:"-"`
+	Models    []string `yaml:"-"`
 }
 
 func newAccessTokenPool() *AccessTokenPool {
@@ -88,6 +90,18 @@ func (a *AccessTokenPool) GetToken() string {
 }
 
 func (a *AccessTokenPool) GetAccessToken() *AccessToken {
+	return a.GetAccessTokenByModel("")
+}
+
+func (a *AccessTokenPool) GetAccessTokenByModel(model string) *AccessToken {
+	tokens := a.GetAccessTokensByModel(model)
+	if len(tokens) == 0 {
+		return nil
+	}
+	return tokens[0]
+}
+
+func (a *AccessTokenPool) GetAccessTokensByModel(model string) []*AccessToken {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -97,16 +111,53 @@ func (a *AccessTokenPool) GetAccessToken() *AccessToken {
 
 	now := common.GetTimestampSecond(0)
 	total := len(a.AccessTokens)
+	tokens := make([]*AccessToken, 0, total)
+	selectedIndex := -1
 
 	for i := 0; i < total; i++ {
-		a.index = (a.index + 1) % total
-		token := a.AccessTokens[a.index]
-		if token.CanUseAt <= now && token.ExpiresAt > now {
-			return token
+		index := (a.index + 1 + i) % total
+		token := a.AccessTokens[index]
+		if token.CanUseAt <= now && token.ExpiresAt > now && accessTokenSupportsModel(token, model) {
+			if selectedIndex < 0 {
+				selectedIndex = index
+			}
+			tokens = append(tokens, token)
 		}
 	}
+	if selectedIndex >= 0 {
+		a.index = selectedIndex
+	}
 
-	return nil
+	return tokens
+}
+
+func (a *AccessTokenPool) CanUseSizeForModel(model string) int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	now := common.GetTimestampSecond(0)
+	count := 0
+	for _, token := range a.AccessTokens {
+		if token.CanUseAt <= now && token.ExpiresAt > now && accessTokenSupportsModel(token, model) {
+			count++
+		}
+	}
+	return count
+}
+
+func accessTokenSupportsModel(token *AccessToken, model string) bool {
+	model = strings.TrimSpace(model)
+	if model == "" || strings.EqualFold(model, "auto") {
+		return true
+	}
+	if len(token.Models) == 0 {
+		return true
+	}
+	for _, candidate := range token.Models {
+		if strings.EqualFold(strings.TrimSpace(candidate), model) {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *AccessTokenPool) SetCanUseAt(token string, canUseAt int64) {

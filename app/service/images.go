@@ -190,7 +190,7 @@ func collectConversationImageResponse(c *gin.Context, prompt string, images []st
 		return collectAuroraConversationImageResponse(c, prompt, tool)
 	}
 	chatReq := imageConversationRequest(prompt, images, tool)
-	resp, accessToken, err := sendChatRequest(c, chatReq)
+	resp, accessToken, err := sendChatRequestForModel(c, chatReq, imageRoutingModel(tool.Model))
 	if err != nil {
 		return nil, err
 	}
@@ -203,66 +203,68 @@ func collectConversationImageResponse(c *gin.Context, prompt string, images []st
 }
 
 func collectAuroraConversationImageResponse(c *gin.Context, prompt string, tool responses.Tool) (map[string]interface{}, error) {
-	backend, err := chatgpt_backend.New(c.Request.Header.Get("Authorization"), chatgpt_backend.Retry())
+	result, err := executeWithModelCandidates(c, imageRoutingModel(tool.Model), func(backend *chatgpt_backend.Client) (*http.Response, error) {
+		chatReq := imageConversationRequest(prompt, nil, tool)
+		applyChatTargetDefaults(backend, chatReq)
+		applyFConversationPayloadDefaults(chatReq)
+		conduitToken, err := prepareFConversation(backend, backend.BaseURL+"/backend-api/f/conversation", chatReq)
+		if err != nil {
+			return nil, err
+		}
+		payload := map[string]interface{}{
+			"action":                   "next",
+			"messages":                 auroraImageMessages(prompt),
+			"parent_message_id":        uuid.New().String(),
+			"model":                    imageChatModel(tool.Model),
+			"client_prepare_state":     "sent",
+			"timezone_offset_min":      chatReq.TimeZoneOffsetMin,
+			"timezone":                 chatReq.Timezone,
+			"conversation_mode":        map[string]string{"kind": "primary_assistant"},
+			"enable_message_followups": true,
+			"system_hints":             []string{"picture_v2"},
+			"supports_buffering":       true,
+			"supported_encodings":      []string{"v1"},
+			"client_contextual_info": map[string]interface{}{
+				"is_dark_mode":      false,
+				"time_since_loaded": 1200,
+				"page_height":       1072,
+				"page_width":        1724,
+				"pixel_ratio":       1.2,
+				"screen_height":     1440,
+				"screen_width":      2560,
+				"app_name":          "chatgpt.com",
+			},
+			"paragen_cot_summary_display_override": "allow",
+			"force_parallel_switch":                "auto",
+			"thinking_effort":                      "standard",
+		}
+		body, err := json.Marshal(payload)
+		if err != nil {
+			return nil, err
+		}
+		upstreamURL := backend.BaseURL + "/backend-api/f/conversation"
+		headers, cookies := backend.Headers(upstreamURL)
+		headers.Set("accept", "text/event-stream")
+		headers.Set("content-type", "application/json")
+		applySentinelHeaders(headers, backend, true)
+		if conduitToken != "" {
+			headers.Set("x-conduit-token", conduitToken)
+		}
+		resp, err := backend.HTTP.Request(tls_client_httpi.POST, upstreamURL, headers, cookies, strings.NewReader(string(body)))
+		if err != nil {
+			return nil, fmt.Errorf("upstream request failed: %w", err)
+		}
+		return resp, nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	chatReq := imageConversationRequest(prompt, nil, tool)
-	applyChatTargetDefaults(backend, chatReq)
-	applyFConversationPayloadDefaults(chatReq)
-	conduitToken, err := prepareFConversation(backend, backend.BaseURL+"/backend-api/f/conversation", chatReq)
-	if err != nil {
-		return nil, err
+	defer result.Response.Body.Close()
+	if result.Response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(result.Response.Body, 64*1024))
+		return nil, fmt.Errorf("upstream returned status %d: %s (token=%s)", result.Response.StatusCode, string(body), maskUpstreamToken(result.Token))
 	}
-	payload := map[string]interface{}{
-		"action":                   "next",
-		"messages":                 auroraImageMessages(prompt),
-		"parent_message_id":        uuid.New().String(),
-		"model":                    imageChatModel(tool.Model),
-		"client_prepare_state":     "sent",
-		"timezone_offset_min":      chatReq.TimeZoneOffsetMin,
-		"timezone":                 chatReq.Timezone,
-		"conversation_mode":        map[string]string{"kind": "primary_assistant"},
-		"enable_message_followups": true,
-		"system_hints":             []string{"picture_v2"},
-		"supports_buffering":       true,
-		"supported_encodings":      []string{"v1"},
-		"client_contextual_info": map[string]interface{}{
-			"is_dark_mode":      false,
-			"time_since_loaded": 1200,
-			"page_height":       1072,
-			"page_width":        1724,
-			"pixel_ratio":       1.2,
-			"screen_height":     1440,
-			"screen_width":      2560,
-			"app_name":          "chatgpt.com",
-		},
-		"paragen_cot_summary_display_override": "allow",
-		"force_parallel_switch":                "auto",
-		"thinking_effort":                      "standard",
-	}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return nil, err
-	}
-	upstreamURL := backend.BaseURL + "/backend-api/f/conversation"
-	headers, cookies := backend.Headers(upstreamURL)
-	headers.Set("accept", "text/event-stream")
-	headers.Set("content-type", "application/json")
-	applySentinelHeaders(headers, backend, true)
-	if conduitToken != "" {
-		headers.Set("x-conduit-token", conduitToken)
-	}
-	resp, err := backend.HTTP.Request(tls_client_httpi.POST, upstreamURL, headers, cookies, strings.NewReader(string(body)))
-	if err != nil {
-		return nil, fmt.Errorf("upstream request failed: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
-		return nil, fmt.Errorf("upstream returned status %d: %s (token=%s)", resp.StatusCode, string(body), maskUpstreamToken(backend.AccAuth))
-	}
-	return collectConversationImageFromSSE(resp.Body, backend)
+	return collectConversationImageFromSSE(result.Response.Body, result.Backend)
 }
 
 func auroraImageMessages(prompt string) []map[string]interface{} {
@@ -323,10 +325,19 @@ func imageChatModel(model string) string {
 	return model
 }
 
+func imageRoutingModel(model string) string {
+	model = strings.TrimSpace(model)
+	if model == "" || strings.HasPrefix(model, "dall-e") {
+		return "gpt-image-2"
+	}
+	return model
+}
+
 func collectConversationImageFromSSE(body io.Reader, backend *chatgpt_backend.Client) (map[string]interface{}, error) {
 	reader := bufio.NewReader(body)
 	var lastMessage string
 	var conversationID string
+	var pendingFileID string
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
@@ -349,6 +360,9 @@ func collectConversationImageFromSSE(body io.Reader, backend *chatgpt_backend.Cl
 		if id := strings.TrimSpace(responseStringValue(event["conversation_id"], "")); id != "" && conversationID == "" {
 			conversationID = id
 		}
+		if fileID := strings.TrimSpace(findImageFileID(event)); fileID != "" {
+			pendingFileID = fileID
+		}
 		if upstreamErr := strings.TrimSpace(responseStringValue(event["error"], "")); upstreamErr != "" {
 			return nil, fmt.Errorf("upstream image generation failed: %s", upstreamErr)
 		}
@@ -360,11 +374,21 @@ func collectConversationImageFromSSE(body io.Reader, backend *chatgpt_backend.Cl
 		if b64, revised := imageResultFromCompleted(event); b64 != "" {
 			return conversationImageCompleted(b64, revised), nil
 		}
+		if backend != nil && conversationID != "" && pendingFileID != "" {
+			if b64, revised, err := downloadConversationImageFile(backend, conversationID, pendingFileID); err == nil && b64 != "" {
+				return conversationImageCompleted(b64, revised), nil
+			}
+		}
 		if text := assistantRawText(event, lastMessage); text != "" {
 			lastMessage = text
 		}
 	}
 	if backend != nil && conversationID != "" {
+		if pendingFileID != "" {
+			if b64, revised, err := downloadConversationImageFile(backend, conversationID, pendingFileID); err == nil && b64 != "" {
+				return conversationImageCompleted(b64, revised), nil
+			}
+		}
 		if completed, err := pollConversationImageResult(backend, conversationID); err == nil {
 			return completed, nil
 		}
@@ -388,6 +412,13 @@ func pollConversationImageResult(backend *chatgpt_backend.Client, conversationID
 		}
 		if b64, revised := imageResultFromCompleted(conversation); b64 != "" {
 			return conversationImageCompleted(b64, revised), nil
+		}
+		if fileID := strings.TrimSpace(findImageFileID(conversation)); fileID != "" {
+			if b64, revised, err := downloadConversationImageFile(backend, conversationID, fileID); err == nil && b64 != "" {
+				return conversationImageCompleted(b64, revised), nil
+			} else if err != nil {
+				lastErr = err
+			}
 		}
 		if message := findImageGenerationError(conversation); message != "" {
 			return nil, fmt.Errorf("upstream image generation failed: %s", message)
@@ -522,6 +553,109 @@ func imageResultFromCompleted(value interface{}) (string, string) {
 		}
 	}
 	return "", ""
+}
+
+func findImageFileID(value interface{}) string {
+	switch v := value.(type) {
+	case map[string]interface{}:
+		for _, key := range []string{"file_id", "fileId"} {
+			if fileID := strings.TrimSpace(responseStringValue(v[key], "")); strings.HasPrefix(fileID, "file_") {
+				return fileID
+			}
+		}
+		if pointer := strings.TrimSpace(responseStringValue(v["asset_pointer"], "")); pointer != "" {
+			if fileID := fileIDFromPointer(pointer); fileID != "" {
+				return fileID
+			}
+		}
+		for _, child := range v {
+			if fileID := findImageFileID(child); fileID != "" {
+				return fileID
+			}
+		}
+	case []interface{}:
+		for _, child := range v {
+			if fileID := findImageFileID(child); fileID != "" {
+				return fileID
+			}
+		}
+	}
+	return ""
+}
+
+func fileIDFromPointer(pointer string) string {
+	pointer = strings.TrimSpace(pointer)
+	for _, prefix := range []string{"file-service://", "sediment://"} {
+		if strings.HasPrefix(pointer, prefix) {
+			return strings.TrimSpace(strings.TrimPrefix(pointer, prefix))
+		}
+	}
+	return ""
+}
+
+func downloadConversationImageFile(backend *chatgpt_backend.Client, conversationID string, fileID string) (string, string, error) {
+	meta, err := fetchConversationFileDownload(backend, conversationID, fileID)
+	if err != nil {
+		return "", "", err
+	}
+	if meta.DownloadURL == "" {
+		return "", "", fmt.Errorf("conversation image download_url is empty")
+	}
+	data, err := fetchConversationFileBinary(backend, meta.DownloadURL)
+	if err != nil {
+		return "", "", err
+	}
+	if len(data) == 0 {
+		return "", "", fmt.Errorf("conversation image file is empty")
+	}
+	return base64.StdEncoding.EncodeToString(data), meta.FileName, nil
+}
+
+type conversationFileDownload struct {
+	DownloadURL string `json:"download_url"`
+	FileName    string `json:"file_name"`
+}
+
+func fetchConversationFileDownload(backend *chatgpt_backend.Client, conversationID string, fileID string) (*conversationFileDownload, error) {
+	path := fmt.Sprintf("/backend-api/files/download/%s?conversation_id=%s&inline=false&download_intent=false", fileID, conversationID)
+	url := backend.BaseURL + path
+	headers, cookies := backend.Headers(url)
+	headers.Set("accept", "application/json")
+	resp, err := backend.HTTP.Request(tls_client_httpi.GET, url, headers, cookies, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("files/download failed: status=%d body=%s", resp.StatusCode, string(body))
+	}
+	result := &conversationFileDownload{}
+	if err := json.Unmarshal(body, result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func fetchConversationFileBinary(backend *chatgpt_backend.Client, url string) ([]byte, error) {
+	headers, cookies := backend.Headers(url)
+	headers.Set("accept", "image/*,*/*")
+	resp, err := backend.HTTP.Request(tls_client_httpi.GET, url, headers, cookies, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 16*1024*1024))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("estuary content download failed: status=%d body=%s", resp.StatusCode, string(body))
+	}
+	return body, nil
 }
 
 func stripImageDataURL(value string) string {

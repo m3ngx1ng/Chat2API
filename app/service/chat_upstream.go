@@ -3,54 +3,15 @@ package service
 import (
 	"bytes"
 	"chat2api/app/chatgpt_backend"
-	"chat2api/app/common"
 	"chat2api/app/types/chat"
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
 	"strings"
 
 	"github.com/aurorax-neo/tls_client_httpi"
-	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
-
-func sendChatRequest(c *gin.Context, chatReq *chat.Request) (*http.Response, string, error) {
-	backend, err := chatgpt_backend.New(c.Request.Header.Get("Authorization"), chatgpt_backend.Retry())
-	if err != nil {
-		return nil, "", err
-	}
-	if err := prepareChatVisionInputs(backend, chatReq); err != nil {
-		return nil, backend.AccAuth, err
-	}
-	applyChatTargetDefaults(backend, chatReq)
-	upstreamURL := backend.ChatURL
-	if shouldUseFConversation(backend) {
-		upstreamURL = backend.BaseURL + "/backend-api/f/conversation"
-		applyFConversationPayloadDefaults(chatReq)
-	}
-	conduitToken, err := prepareFConversation(backend, upstreamURL, chatReq)
-	if err != nil {
-		return nil, backend.AccAuth, err
-	}
-	body, err := common.Struct2BytesBuffer(chatReq)
-	if err != nil {
-		return nil, backend.AccAuth, err
-	}
-	headers, cookies := backend.Headers(upstreamURL)
-	headers.Set("accept", "text/event-stream")
-	headers.Set("content-type", "application/json")
-	applySentinelHeaders(headers, backend, true)
-	if conduitToken != "" {
-		headers.Set("x-conduit-token", conduitToken)
-	}
-	response, err := backend.HTTP.Request(tls_client_httpi.POST, upstreamURL, headers, cookies, body)
-	if err != nil {
-		return nil, backend.AccAuth, fmt.Errorf("upstream request failed: %w", err)
-	}
-	return response, backend.AccAuth, nil
-}
 
 func applyChatTargetDefaults(backend *chatgpt_backend.Client, chatReq *chat.Request) {
 	timezone, offset := backend.ChatTimezone()

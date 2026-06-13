@@ -250,6 +250,7 @@ func normalizeConfig(cfg *app) {
 			Token:     "Bearer " + token,
 			ExpiresAt: time.Now().Add(24 * time.Hour).Unix(),
 			Proxy:     strings.TrimSpace(account.Proxy),
+			Models:    normalizeModelNames(account.SelectedModels),
 		})
 	}
 }

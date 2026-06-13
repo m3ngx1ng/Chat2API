@@ -29,6 +29,8 @@ type Client struct {
 	Pow       Resources
 }
 
+type AccessTokenCandidate = token_pool.AccessToken
+
 type chatRequirements struct {
 	OaiDeviceID    string    `json:"-"`
 	Arkose         challenge `json:"arkose"`
@@ -46,6 +48,10 @@ type challenge struct {
 }
 
 func New(token string, retry int) (*Client, error) {
+	return NewForModel(token, "", retry)
+}
+
+func NewForModel(token string, model string, retry int) (*Client, error) {
 	token = strings.TrimSpace(token)
 	localToken := strings.TrimSpace(strings.TrimPrefix(token, "Bearer "))
 	appConf := conf.GetApp()
@@ -56,24 +62,35 @@ func New(token string, retry int) (*Client, error) {
 		return newClient(token, "")
 	}
 	if !token_pool.GetAccessTokenPool().IsEmpty() {
-		accessToken := token_pool.GetAccessTokenPool().GetAccessToken()
+		accessToken := token_pool.GetAccessTokenPool().GetAccessTokenByModel(model)
 		if accessToken == nil || accessToken.Token == "" {
-			return nil, fmt.Errorf("access token pool is empty")
+			return nil, fmt.Errorf("access token pool has no available account for model %q", strings.TrimSpace(model))
 		}
-		client, err := newClient(accessToken.Token, accessToken.Proxy)
-		if client == nil && retry > 0 {
-			return New(token, retry-1)
-		}
-		return client, err
+		return NewWithAccessToken(accessToken, retry)
 	}
 	if strings.HasPrefix(localToken, "sk-") {
 		return nil, fmt.Errorf("access token pool is empty")
 	}
 	client, err := newClient(token, "")
 	if client == nil && retry > 0 {
-		return New(token, retry-1)
+		return NewForModel(token, model, retry-1)
 	}
 	return client, err
+}
+
+func NewWithAccessToken(accessToken *AccessTokenCandidate, retry int) (*Client, error) {
+	if accessToken == nil || accessToken.Token == "" {
+		return nil, fmt.Errorf("access token is empty")
+	}
+	client, err := newClient(accessToken.Token, accessToken.Proxy)
+	if client == nil && retry > 0 {
+		return NewWithAccessToken(accessToken, retry-1)
+	}
+	return client, err
+}
+
+func AccessTokenCandidates(model string) []*AccessTokenCandidate {
+	return token_pool.GetAccessTokenPool().GetAccessTokensByModel(model)
 }
 
 func NewExplicit(token string, accountProxy string) (*Client, error) {

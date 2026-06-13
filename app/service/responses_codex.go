@@ -140,21 +140,23 @@ func sendCodexResponsesRequest(c *gin.Context, payload codexResponsesPayload) (*
 	if err != nil {
 		return nil, "", err
 	}
-	backend, err := chatgpt_backend.New(c.Request.Header.Get("Authorization"), chatgpt_backend.Retry())
+	result, err := executeWithModelCandidates(c, payload.Model, func(backend *chatgpt_backend.Client) (*http.Response, error) {
+		url := backend.BaseURL + "/backend-api/codex/responses"
+		headers, cookies := backend.Headers(url)
+		headers.Set("content-type", "application/json")
+		if backend.AccAuth == "" {
+			return nil, fmt.Errorf("codex responses endpoint requires access token auth")
+		}
+		resp, err := backend.HTTP.Request(tls_client_httpi.POST, url, headers, cookies, bytes.NewBuffer(body))
+		if err != nil {
+			return nil, fmt.Errorf("upstream codex responses request failed: %w", err)
+		}
+		return resp, nil
+	})
 	if err != nil {
 		return nil, "", err
 	}
-	url := backend.BaseURL + "/backend-api/codex/responses"
-	headers, cookies := backend.Headers(url)
-	headers.Set("content-type", "application/json")
-	if backend.AccAuth == "" {
-		return nil, backend.AccAuth, fmt.Errorf("codex responses endpoint requires access token auth")
-	}
-	resp, err := backend.HTTP.Request(tls_client_httpi.POST, url, headers, cookies, bytes.NewBuffer(body))
-	if err != nil {
-		return nil, backend.AccAuth, fmt.Errorf("upstream codex responses request failed: %w", err)
-	}
-	return resp, backend.AccAuth, nil
+	return result.Response, result.Token, nil
 }
 
 func streamCodexResponses(c *gin.Context, resp *http.Response) error {
