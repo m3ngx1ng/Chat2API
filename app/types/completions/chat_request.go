@@ -1,6 +1,7 @@
 package completions
 
 import (
+	"regexp"
 	"strings"
 
 	"chat2api/app/types/chat"
@@ -8,11 +9,13 @@ import (
 	"github.com/google/uuid"
 )
 
+var inlineImageDataURLPattern = regexp.MustCompile(`(?is)data:image/[a-z0-9.+-]+;base64,[a-z0-9+/=\r\n]+`)
+
 func BuildChatRequest(apiReq *ApiReq) *chat.Request {
 	sourceMessages := chatRequestMessages(apiReq)
 	messages := make([]chat.Message, 0, len(sourceMessages))
 	for _, apiMessage := range sourceMessages {
-		content := chatContentFromOpenAI(apiMessage.Content)
+		content := chatContentFromOpenAI(sanitizeOpenAIMessageContent(apiMessage.Content))
 		messages = append(messages, chat.Message{
 			Id: uuid.New().String(),
 			Author: chat.Author{
@@ -59,6 +62,50 @@ func BuildChatRequest(apiReq *ApiReq) *chat.Request {
 			ScreenWidth:     2560,
 		},
 	}
+}
+
+func sanitizeOpenAIMessageContent(content interface{}) interface{} {
+	return sanitizeOpenAIMessageContentWithKey("", content)
+}
+
+func sanitizeOpenAIMessageContentWithKey(key string, content interface{}) interface{} {
+	switch v := content.(type) {
+	case string:
+		if shouldKeepImagePayloadKey(key) {
+			return content
+		}
+		return sanitizeInlineImageDataURLs(v)
+	case []interface{}:
+		items := make([]interface{}, 0, len(v))
+		for _, item := range v {
+			items = append(items, sanitizeOpenAIMessageContentWithKey("", item))
+		}
+		return items
+	case map[string]interface{}:
+		clone := make(map[string]interface{}, len(v))
+		for key, value := range v {
+			clone[key] = sanitizeOpenAIMessageContentWithKey(key, value)
+		}
+		return clone
+	default:
+		return content
+	}
+}
+
+func shouldKeepImagePayloadKey(key string) bool {
+	switch strings.TrimSpace(strings.ToLower(key)) {
+	case "image_url", "url", "b64_json", "base64", "data":
+		return true
+	default:
+		return false
+	}
+}
+
+func sanitizeInlineImageDataURLs(text string) string {
+	if text == "" || !strings.Contains(strings.ToLower(text), "data:image/") {
+		return text
+	}
+	return inlineImageDataURLPattern.ReplaceAllString(text, "[image omitted: inline base64 image removed to stay within upstream message size limits]")
 }
 
 func chatRequestMessages(apiReq *ApiReq) []ApiMessage {
